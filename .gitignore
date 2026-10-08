@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Виртуальные окружения
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ОС
+.DS_Store
+Thumbs.db
+
+# Логи и отладочные файлы приложения
+http_debug.log
+*.log
+
+# Конфигурационный файл приложения (содержит IP и пароль root!)
+mfc_flasher_config.json
+
+# Артефакты, выгружаемые с устройства
+plan_export_*.xml
+operation_log_*.log
+io_can_box2_*.csv
+*.bak_*

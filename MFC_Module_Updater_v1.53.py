@@ -1,5 +1,29 @@
-# Необходимые библиотеки для работы приложения:
-# pip install PyQt6 paramiko
+"""
+MFC Module Updater (IskraIO) — настольное приложение для прошивки модулей МФК.
+
+Назначение:
+    Автоматизация процесса обновления прошивок модулей многофункционального
+    контроллера (МФК) через SSH/SFTP-агента IskraIO_Util и HTTP-бэкенд устройства.
+
+Возможности:
+    - Загрузка агента и файлов прошивок на устройство (операция 1);
+    - Создание сценария прошивки MakePlan (операция 2);
+    - Импорт/экспорт сценария plan.xml (операции 3, 4);
+    - Запуск прошивки Update с анализом result.txt (операция 6);
+    - Выгрузка дампа операции (операция 7);
+    - Просмотр результата прошивки (операция 8);
+    - Редактирование сценария прошивки (СП) с автозаполнением (операции 9, 11);
+    - Получение информации о модулях через HTTP-бэкенд (операция 10).
+
+Зависимости:
+    pip install -r requirements.txt   # PyQt6, paramiko
+
+Запуск:
+    python MFC_Module_Updater_v1.53.py
+
+Автор: Екимов Д.А. @ 2026
+Версия: 1.53
+"""
 import sys
 import os
 import json
@@ -84,7 +108,14 @@ QMessageBox QPushButton { background-color: #0078d7; color: white; min-width: 80
 # ============================================================
 
 class SSHClient:
-    """Класс-обертка для работы с SSH и SFTP"""
+    """
+    Класс-обертка для работы с SSH и SFTP.
+
+    Примечание: используется AutoAddPolicy (доверяем неизвестным ключам хоста),
+    что допустимо только в доверенной локальной сети устройства.
+    Пароль root хранится в локальном конфиге mfc_flasher_config.json
+    (файл добавлен в .gitignore).
+    """
     def __init__(self, ip, password):
         self.ip = ip
         self.password = password
@@ -300,6 +331,7 @@ class BackendClient:
 
 
 def parse_plan_xml(xml_path):
+    """Разбор plan.xml: список модулей сценария прошивки по элементам <Image>."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     modules = []
@@ -314,6 +346,7 @@ def parse_plan_xml(xml_path):
 
 
 def parse_result_txt(txt_content):
+    """Разбор result.txt: {slot: статус} ('Complete' либо текст ошибки)."""
     results = {}
     pattern = re.compile(r'slot=(\d+)\s+"([^"]+)":\s+(.*)')
     for line in txt_content.splitlines():
