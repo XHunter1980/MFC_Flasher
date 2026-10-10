@@ -21,7 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Синтаксическая проверка кода (py_compile)
-        run: python -m py_compile MFC_Module_Updater_v1.53.py
+        run: python -m py_compile MFC_Module_Updater_v1.54.py
 
       - name: Линтер ruff (стиль и потенциальные баги)
         run: |

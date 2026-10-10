@@ -35,7 +35,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed \
             --name MFC_Flasher \
-            MFC_Module_Updater_v1.53.py
+            MFC_Module_Updater_v1.54.py
 
       - name: Проверка результата сборки
         shell: bash

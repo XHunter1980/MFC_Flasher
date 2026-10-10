@@ -1,4 +1,4 @@
-# MFC Module Updater (MFC_Flasher) v1.53
+# MFC Module Updater (MFC_Flasher) v1.54
 
 Настольное GUI-приложение (PyQt6) для прошивки модулей многофункционального
 контроллера (МФК / IskraIO). Автоматизирует полный цикл обновления прошивок:
@@ -43,14 +43,14 @@ venv\Scripts\activate
 source venv/bin/activate
 
 pip install -r requirements.txt
-python MFC_Module_Updater_v1.53.py
+python MFC_Module_Updater_v1.54.py
 ```
 
 Для сборки исполняемого файла (по желанию):
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name MFC_Module_Updater MFC_Module_Updater_v1.53.py
+pyinstaller --onefile --windowed --name MFC_Module_Updater MFC_Module_Updater_v1.54.py
 ```
 
 ## Конфигурация
@@ -87,11 +87,12 @@ full_<МАРКЕР>_<ТИП>_<...>_R<мажор>.<минор>_<ДДММГГ>.bin
 
 ```
 .
-├── MFC_Module_Updater_v1.53.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
+├── MFC_Module_Updater_v1.54.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
 ├── requirements.txt              # Зависимости
 ├── pyproject.toml                # Конфигурация линтера ruff
 ├── .gitattributes                # Нормализация переводов строк
 ├── .gitignore                    # Исключения (конфиг с паролем, логи, артефакты)
+├── CHANGELOG.md                  # История изменений по версиям
 ├── README.md
 └── .github/workflows/
     ├── ci.yml                    # CI: py_compile + ruff + проверка зависимостей
@@ -143,15 +144,15 @@ ruff check --fix .    # автоисправление безопасных за
 - **Build Windows EXE** (`build-exe.yml`):
   - ручной запуск (Actions → *Build Windows EXE* → *Run workflow*) — собирает
     `MFC_Flasher.exe` на windows-latest и складывает его в Artifacts;
-  - **push тега `v*`** (например `v1.53`) — автоматически собирает `.exe` и
+  - **push тега `v*`** (например `v1.54`) — автоматически собирает `.exe` и
     публикует **GitHub Release** с вложенным `MFC_Flasher.exe` и заметками,
     сгенерированными из истории коммитов.
 
 Выпуск релиза:
 
 ```bash
-git tag v1.53
-git push origin v1.53   # Actions соберёт exe и создаст Release
+git tag v1.54 -m "MFC_Flasher v1.54"
+git push origin v1.54   # Actions соберёт exe и создаст Release
 ```
 
 ## Примечания и известные ограничения

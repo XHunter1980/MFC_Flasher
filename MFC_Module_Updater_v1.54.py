@@ -19,10 +19,13 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Updater_v1.53.py
+    python MFC_Module_Updater_v1.54.py
+
+История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
+версию APP_VERSION и добавляйте запись в историю).
 
 Автор: Екимов Д.А. @ 2026
-Версия: 1.53
+Версия: 1.54
 """
 import html
 import http.cookiejar
@@ -62,6 +65,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# --- Версия приложения (единая точка изменения при доработках) ---
+APP_VERSION = "1.54"
+APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
 DEFAULT_CONFIG = {
@@ -1285,7 +1292,7 @@ class EditSPDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Прошивка модулей МФК версия 1.53")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1000, 800)
         self.config = self.load_config()
         self.init_ui()
