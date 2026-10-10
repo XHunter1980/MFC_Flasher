@@ -1,0 +1,37 @@
+# Конфигурация инструментов разработки (ruff — линтер/форматтер)
+# Запуск локально:  ruff check .   |   Установка: pip install ruff
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+# Включаемые наборы правил:
+#   E/W - pycodestyle (ошибки/предупреждения стиля)
+#   F   - pyflakes (неиспользуемые импорты/переменные, неопределённые имена)
+#   I   - isort (порядок импортов)
+#   UP  - pyupgrade (современный синтаксис Python)
+#   B   - flake8-bugbear (потенциальные баги)
+#   C4  - flake8-comprehensions (эффективные списковые включения)
+select = ["E", "W", "F", "I", "UP", "B", "C4"]
+
+ignore = [
+    # Специфика данного GUI-приложения (осознанные решения):
+    "BLE001", # except Exception в фоновых потоках и сетевом коде — защита от падения UI
+    "TRY002", # raise Exception вместо пользовательских классов исключений — исторический стиль кода
+    "S110",   # try/except/pass при завершении необязательных операций (закрытие SFTP, удаление temp-файлов)
+    "E501",   # длинные строки: CSS-стили, User-Agent, HTML-разметка журнала — перенос снижает читаемость
+]
+
+[tool.ruff.lint.per-file-ignores]
+"MFC_Module_Updater_v1.53.py" = [
+    "RUF059", # unpacked-переменные stdin/stderr из paramiko exec_command — часть обязательного кортежа возврата
+]

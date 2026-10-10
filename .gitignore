@@ -37,3 +37,8 @@ plan_export_*.xml
 operation_log_*.log
 io_can_box2_*.csv
 *.bak_*
+
+# Артефакты сборки PyInstaller (см. .github/workflows/build-exe.yml)
+build/
+dist/
+*.spec

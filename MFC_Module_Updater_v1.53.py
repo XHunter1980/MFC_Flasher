@@ -24,25 +24,44 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
 Автор: Екимов Д.А. @ 2026
 Версия: 1.53
 """
-import sys
-import os
-import json
 import html
-import paramiko
-import xml.etree.ElementTree as ET
-import re
-import tempfile
-import urllib.request
-import urllib.error
 import http.cookiejar
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QLineEdit, QPushButton, QFileDialog, QTextEdit,
-                             QProgressBar, QMessageBox, QCheckBox, QTableWidget, QTableWidgetItem,
-                             QDialog, QDialogButtonBox, QGroupBox, QGridLayout, QHeaderView,
-                             QComboBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QColor
+
+import paramiko
+from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 CONFIG_FILE = "mfc_flasher_config.json"
 DEFAULT_CONFIG = {
@@ -148,7 +167,7 @@ class SSHClient:
         sftp = self.client.open_sftp()
         try:
             sftp.remove(path)
-        except IOError:
+        except OSError:
             pass
         sftp.close()
 
@@ -158,7 +177,7 @@ class SSHClient:
             stat = sftp.stat(path)
             sftp.close()
             return stat
-        except IOError:
+        except OSError:
             sftp.close()
             return None
 
@@ -168,7 +187,7 @@ class SSHClient:
             files = sftp.listdir(path)
             sftp.close()
             return files
-        except IOError:
+        except OSError:
             sftp.close()
             return []
 
@@ -194,7 +213,7 @@ class BackendClient:
         self.log_file = "http_debug.log"
         try:
             with open(self.log_file, "w", encoding="utf-8") as f:
-                f.write(f"=== HTTP Debug Log ===\n")
+                f.write("=== HTTP Debug Log ===\n")
                 f.write(f"Создан BackendClient для {self.ip}\n")
                 f.write(f"API URL: {self.api_url}\n\n")
         except Exception as e:
@@ -318,7 +337,7 @@ class BackendClient:
 
             # Если сессия устарела или невалидна — сбрасываем и пробуем снова (но не более 3 раз)
             if data.get("result") == 2:
-                self._log(f"⚠ Ошибка авторизации (result=2). Сбрасываем токен и пробуем снова...")
+                self._log("⚠ Ошибка авторизации (result=2). Сбрасываем токен и пробуем снова...")
                 self.token = None
                 self.sid = None
                 return self.request(req_name, params, login_name, _retry_count + 1)
@@ -450,20 +469,28 @@ class OperationWorker(QThread):
             ssh.connect()
             self.log("Подключение к устройству установлено")
 
-            if self.op_id == 1: self._op1_upload_agent(ssh)
-            elif self.op_id == 2: self._op2_make_plan(ssh)
-            elif self.op_id == 3: self._op3_import_plan(ssh)
-            elif self.op_id == 4: self._op4_export_plan(ssh)
-            elif self.op_id == 6: self._op6_update(ssh)
-            elif self.op_id == 7: self._op7_download_dump(ssh)
-            elif self.op_id == 8: self._op8_view_result(ssh)
-            elif self.op_id == 9: self._op9_edit_plan(ssh)
+            if self.op_id == 1:
+                self._op1_upload_agent(ssh)
+            elif self.op_id == 2:
+                self._op2_make_plan(ssh)
+            elif self.op_id == 3:
+                self._op3_import_plan(ssh)
+            elif self.op_id == 4:
+                self._op4_export_plan(ssh)
+            elif self.op_id == 6:
+                self._op6_update(ssh)
+            elif self.op_id == 7:
+                self._op7_download_dump(ssh)
+            elif self.op_id == 8:
+                self._op8_view_result(ssh)
+            elif self.op_id == 9:
+                self._op9_edit_plan(ssh)
 
             ssh.close()
             self.finished_signal.emit(True, "Операция завершена успешно", {})
         except Exception as e:
-            self.log(f"Критическая ошибка: {str(e)}")
-            self.finished_signal.emit(False, f"Ошибка: {str(e)}", {})
+            self.log(f"Критическая ошибка: {e!s}")
+            self.finished_signal.emit(False, f"Ошибка: {e!s}", {})
 
     def _check_service_status(self, ssh, service_name):
         out, _ = ssh.exec_command(f"systemctl is-active {service_name}")
@@ -568,13 +595,13 @@ class OperationWorker(QThread):
         except Exception as e:
             os.remove(tmp_path)
             ssh.close()
-            raise Exception(f"Не удалось загрузить plan.xml: {e}")
+            raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
         finally:
             ssh.close()
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
-                except:
+                except OSError:
                     pass
         self.progress_signal.emit(100)
         self.log(f"Данные для редактора подготовлены. Модулей: {len(modules_info)}, прошивок: {len(firmwares)}")
@@ -719,12 +746,12 @@ class OperationWorker(QThread):
             plan_modules = parse_plan_xml(tmp_path)
         except Exception as e:
             os.remove(tmp_path)
-            raise Exception(f"Не удалось загрузить plan.xml: {e}")
+            raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
         finally:
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
-                except:
+                except OSError:
                     pass
         self.progress_signal.emit(100)
         self.finished_signal.emit(True, "Редактирование СП", {
@@ -1258,7 +1285,7 @@ class MainWindow(QMainWindow):
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            with open(CONFIG_FILE, encoding='utf-8') as f:
                 return json.load(f)
         return DEFAULT_CONFIG.copy()
 
