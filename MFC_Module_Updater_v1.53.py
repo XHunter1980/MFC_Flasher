@@ -521,7 +521,31 @@ class OperationWorker(QThread):
         status = self._check_service_status(ssh, "PrjA.service")
         self.log(f"PrjA.service статус после запуска: {status}")
 
+    @staticmethod
+    def _resolve_module_type(info):
+        """Определяет тип модуля по записи module_info_arr.
+
+        Если module_type пустой или 'NA' (модуль не распознан по ID),
+        используется module_type_config из конфигурации креста.
+        """
+        module_type = (info.get("module_type") or "").strip() or "NA"
+        if module_type.upper() == "NA":
+            cfg = (info.get("module_type_config") or "").strip()
+            if cfg and cfg.upper() != "NA":
+                module_type = cfg
+        return module_type
+
     def _fetch_module_info(self):
+        """Запрос IskraIOGetAll и построение списка установленных модулей.
+
+        Соответствие записей двух массивов ответа:
+        - module_info_arr — описание слотов креста; поле 'index' может быть
+          как 0-базируемым (совпадает с позицией в массиве), так и 1-базируемым
+          (совпадает со slot_num). База определяется автоматически;
+        - module_arr — данные установленных модулей с 'slot_num' (1-базируемый).
+        Тип модуля берётся из module_info_arr (с учётом module_type_config),
+        серийный номер/версии — из module_arr.
+        """
         self.log("Получение информации о модулях через HTTP...")
         client = BackendClient(
             self.config['ip'],
@@ -532,29 +556,115 @@ class OperationWorker(QThread):
         if data.get("result") != 0:
             raise Exception(f"Бэкенд вернул ошибку: result={data.get('result')}")
 
-        module_arr = data["data"].get("module_arr", [])
-        module_info_arr = data["data"].get("module_info_arr", [])
-        info_by_index = {info["index"]: info for info in module_info_arr}
+        resp_data = data.get("data") or {}
+        module_arr = resp_data.get("module_arr") or []
+        module_info_arr = resp_data.get("module_info_arr") or []
+        crate_slot_count = resp_data.get("crate_slot_count")
 
-        result = []
-        for mod in module_arr:
-            if not mod or "slot_num" not in mod:
-                continue
-            slot_num = mod["slot_num"]
-            info = info_by_index.get(slot_num - 1, {})
-            module_type = info.get("module_type", "NA") or "NA"
-            if module_type == "NA":
-                cfg = info.get("module_type_config", "")
-                if cfg:
-                    module_type = cfg
-            result.append({
-                "slot_num": str(slot_num),
-                "module_type": module_type,
-                "serial_num": mod.get("serial_num") or "N/A",
-                "manufacture_date": mod.get("manufacture_date") or "N/A",
-                "hardware_version": mod.get("hardware_version") or "N/A",
-                "firmware_version": mod.get("firmware_version") or "N/A"
-            })
+        # Индексы из module_info_arr, отсортированные по возрастанию.
+        indexes = sorted(int(info["index"]) for info in module_info_arr
+                         if isinstance(info, dict) and "index" in info)
+        slots = sorted(int(mod["slot_num"]) for mod in module_arr
+                       if isinstance(mod, dict) and "slot_num" in mod)
+
+        info_by_index = {}
+        for info in module_info_arr:
+            if isinstance(info, dict) and "index" in info:
+                info_by_index[int(info["index"])] = info
+
+        self.log(f"Слотов креста: {crate_slot_count if crate_slot_count is not None else 'н/д'}, "
+                 f"записей module_info_arr: {len(info_by_index)}, "
+                 f"записей module_arr: {len(module_arr)}")
+
+        def build_result(index_base):
+            """Список модулей при заданной базе индексации module_info_arr.
+
+            slot = index - base + 1, где base=0 для 0-базируемого 'index'
+            (CPU в слоте 2 имеет index=1) и base=1 для 1-базируемого
+            (CPU в слоте 1 имеет index=1).
+            """
+            # Слот -> тип модуля из module_info_arr (корректировка на базу)
+            type_by_slot = {}
+            for idx, info in info_by_index.items():
+                slot = idx - index_base + 1
+                if slot > 0:
+                    type_by_slot[slot] = self._resolve_module_type(info)
+
+            # Модули, отсутствующие в module_arr, добираем из module_info_arr
+            # (например, модуль без ответов телеметрии, но сконфигурированный в кресте).
+            present_slots = set(slots)
+            extra_slots = []
+            for slot, ttype in type_by_slot.items():
+                if slot not in present_slots and ttype.upper() != "NA":
+                    extra_slots.append(slot)
+            all_slots = sorted(present_slots | set(extra_slots))
+
+            mod_by_slot = {}
+            for mod in module_arr:
+                if isinstance(mod, dict) and "slot_num" in mod:
+                    s = int(mod["slot_num"])
+                    # при дублях приоритет записи с непустым serial_num
+                    prev = mod_by_slot.get(s)
+                    if prev is None or (not (prev.get("serial_num") or "")
+                                        and (mod.get("serial_num") or "")):
+                        mod_by_slot[s] = mod
+
+            rows = []
+            for slot in all_slots:
+                mod = mod_by_slot.get(slot, {})
+                module_type = type_by_slot.get(slot, "NA")
+                source = "module_arr" if slot in present_slots else "module_info_arr"
+                rows.append({
+                    "slot_num": str(slot),
+                    "module_type": module_type,
+                    "serial_num": mod.get("serial_num") or "N/A",
+                    "manufacture_date": mod.get("manufacture_date") or "N/A",
+                    "hardware_version": mod.get("hardware_version") or "N/A",
+                    "firmware_version": mod.get("firmware_version") or "N/A",
+                    "source": source,
+                })
+            return rows
+
+        def score(rows):
+            """Число строк с установленным (не NA) типом — метрика качества сопоставления."""
+            return sum(1 for r in rows if r["module_type"].upper() != "NA")
+
+        def na_with_data(rows):
+            """Строки из module_arr (модуль отвечает), но тип не определён — признак сдвига."""
+            return sum(1 for r in rows
+                       if r["source"] == "module_arr"
+                       and r["module_type"].upper() == "NA"
+                       and r["serial_num"] != "N/A")
+
+        # Автоопределение базы индексации module_info_arr относительно slot_num
+        # (поле 'index' у разных прошивок бэкенда бывает 0- или 1-базируемым;
+        # ошибочная база даёт смещение типов на один слот).
+        candidates = [0]
+        if indexes and min(indexes) >= 1:
+            # Индекс 0 отсутствует — вероятно, массив 1-базируемый; проверяем гипотезу.
+            candidates.append(1)
+
+        # Приоритет: максимум распознанных типов, минимум «данные+NA», база 0 как консервативная.
+        scored = sorted(((score(build_result(b)), -na_with_data(build_result(b)), b)
+                         for b in candidates),
+                        key=lambda x: (-x[0], -x[1], x[2]))
+        index_base = scored[0][2]
+
+        result = build_result(index_base)
+        if len(candidates) > 1:
+            self.log(f"База индексации module_info_arr: {index_base} "
+                     f"(slot = index{' - 0' if index_base == 0 else ''} + 1)")
+
+        for r in result:
+            if r["module_type"].upper() == "NA":
+                self.log(f"Слот {r['slot_num']}: тип модуля не определён (NA)")
+
+        # Предупреждение о возможном смещении: модули с данными, но без типа.
+        warn = na_with_data(result)
+        if warn:
+            self.log(f"Внимание: {warn} модулей имеют данные, но тип NA — "
+                     "возможен сдвиг индексов между module_arr и module_info_arr")
+
         return result
 
     def _scan_firmware_dir(self):
@@ -577,6 +687,9 @@ class OperationWorker(QThread):
     def _op10_get_module_info(self):
         modules_data = self._fetch_module_info()
         self.progress_signal.emit(100)
+        # Отладочная сводка: слот -> тип (помогает выявить смещение индексов)
+        summary = ", ".join(f"{m['slot_num']}:{m['module_type']}" for m in modules_data)
+        self.log(f"Соответствие слот/тип: {summary}")
         self.log(f"Найдено модулей: {len(modules_data)}")
         self.finished_signal.emit(True, "Информация получена",
                                   {"modules": modules_data, "action": "module_info"})
