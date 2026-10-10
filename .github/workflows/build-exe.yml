@@ -3,12 +3,20 @@ name: Build Windows EXE
 # Сборка .exe через PyInstaller на windows-latest.
 # 1) Ручной запуск (Actions -> Build Windows EXE -> Run workflow): артефакт dist-экземпляр.
 # 2) Push тега vX.Y.Z: сборка + автоматический релиз GitHub с вложенным .exe.
+#
+# Права: contents:write нужен action-у для загрузки ассета в релиз;
+# generate_release_notes требует разрешений в Settings -> Actions -> General
+# ("Read and write permissions"), поэтому при их отсутствии используется
+# запасной способ создания релиза через REST API (token GITHUB_TOKEN).
 
 on:
   workflow_dispatch:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -59,3 +67,30 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Запасной релиз через REST API (если action не смог)
+        if: failure() && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Создаём релиз (неfatal, если уже существует)
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md.\",\"draft\":false,\"prerelease\":false}" \
+            || echo "Релиз, возможно, уже существует"
+          RELEASE_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+            | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=MFC_Flasher.exe" \
+            --data-binary "@dist/MFC_Flasher.exe"
+          echo "Ассет MFC_Flasher.exe загружен в релиз $TAG"
