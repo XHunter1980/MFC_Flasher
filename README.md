@@ -1,4 +1,4 @@
-# MFC Module Updater (MFC_Flasher) v1.60
+# MFC Module Updater (MFC_Flasher) v1.61
 
 Настольное GUI-приложение (PyQt6) для прошивки модулей многофункционального
 контроллера (МФК / IskraIO). Автоматизирует полный цикл обновления прошивок:
@@ -50,7 +50,7 @@ python MFC_Module_Flasher_v*.py   # актуальная версия, см. APP
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name "MFC_Flasher_v$(версия)" MFC_Module_Flasher_v1.60.py
+pyinstaller --onefile --windowed --name "MFC_Flasher_v$(версия)" MFC_Module_Flasher_v1.61.py
 ```
 
 ## Конфигурация
@@ -87,7 +87,7 @@ full_<МАРКЕР>_<ТИП>_<...>_R<мажор>.<минор>_<ДДММГГ>.bin
 
 ```
 .
-├── MFC_Module_Flasher_v1.60.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
+├── MFC_Module_Flasher_v1.61.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
 ├── requirements.txt              # Зависимости
 ├── pyproject.toml                # Конфигурация линтера ruff
 ├── .gitattributes                # Нормализация переводов строк

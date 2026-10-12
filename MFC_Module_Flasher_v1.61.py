@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.60.1"
+APP_VERSION = "1.61"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -369,6 +369,18 @@ class BackendClient:
             raise
 
 
+def normalize_img_type(value):
+    """Приводит тип образа из plan.xml к внутреннему значению ('apply'/'boot').
+
+    В файле сценария тип apply записывается как 'appl' (требование бэкенда),
+    при чтении обратно значение восстанавливается.
+    """
+    v = (value or '').strip().lower()
+    if v == 'appl':
+        return 'apply'
+    return v
+
+
 def parse_plan_xml(xml_path):
     """Разбор plan.xml: список модулей сценария прошивки по элементам <Image>."""
     tree = ET.parse(xml_path)
@@ -379,7 +391,7 @@ def parse_plan_xml(xml_path):
             'slot': img.get('module_slot'),
             'type': img.get('module_type'),
             'path': img.get('path'),
-            'img_type': img.get('type')
+            'img_type': normalize_img_type(img.get('type'))
         })
     return modules
 
@@ -1286,7 +1298,7 @@ class EditSPDialog(QDialog):
                 "module_type": info.get('module_type', 'NA'),
                 "device_fw_version": info.get('firmware_version', 'N/A'),
                 "path": plan.get('path', ''),
-                "img_type": plan.get('img_type', 'apply') or 'apply',
+                "img_type": normalize_img_type(plan.get('img_type')) or 'apply',
                 "local_fw": None,
                 "flashable": flashable,
                 "unflash_reason": unflash_reason,
@@ -1683,13 +1695,15 @@ class EditSPDialog(QDialog):
             return
 
         # Корень сценария прошивки — <Root> (по требованию бэкенда; раньше был <Plan>)
+        # Тип образа 'apply' записывается в файл как 'appl' (требование бэкенда).
         root = ET.Element("Root")
         for row in selected:
+            xml_type = "appl" if row['img_type'] == "apply" else row['img_type']
             ET.SubElement(root, "Image", {
                 "module_slot": row['slot'],
                 "module_type": row['module_type'],
                 "path": row['path'],
-                "type": row['img_type']
+                "type": xml_type
             })
         tree = ET.ElementTree(root)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
