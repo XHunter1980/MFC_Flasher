@@ -1,4 +1,4 @@
-# MFC Module Updater (MFC_Flasher) v1.58
+# MFC Module Updater (MFC_Flasher) v1.59
 
 Настольное GUI-приложение (PyQt6) для прошивки модулей многофункционального
 контроллера (МФК / IskraIO). Автоматизирует полный цикл обновления прошивок:
@@ -50,7 +50,7 @@ python MFC_Module_Updater_v*.py   # актуальная версия, см. APP
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name "MFC_Flasher_v$(версия)" MFC_Module_Updater_v1.58.py
+pyinstaller --onefile --windowed --name "MFC_Flasher_v$(версия)" MFC_Module_Updater_v1.59.py
 ```
 
 ## Конфигурация
@@ -87,7 +87,7 @@ full_<МАРКЕР>_<ТИП>_<...>_R<мажор>.<минор>_<ДДММГГ>.bin
 
 ```
 .
-├── MFC_Module_Updater_v1.58.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
+├── MFC_Module_Updater_v1.59.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
 ├── requirements.txt              # Зависимости
 ├── pyproject.toml                # Конфигурация линтера ruff
 ├── .gitattributes                # Нормализация переводов строк
@@ -144,14 +144,14 @@ ruff check --fix .    # автоисправление безопасных за
 - **Build Windows EXE** (`build-exe.yml`):
   - ручной запуск (Actions → *Build Windows EXE* → *Run workflow*) — собирает
     `MFC_Flasher_v<VER>.exe` (версия из `APP_VERSION`) на windows-latest и складывает его в Artifacts;
-  - **push тега `v*`** (например `v1.58`) — автоматически собирает `.exe` и
+  - **push тега `v*`** (например `v1.59`) — автоматически собирает `.exe` и
     публикует **GitHub Release** с вложенным `MFC_Flasher_v<VER>.exe` и заметками,
     сгенерированными из истории коммитов.
 
 Выпуск релиза:
 
 ```bash
-git tag v1.58 -m "MFC_Flasher v1.58"
+git tag v1.59 -m "MFC_Flasher v1.59"
 git push origin v1.57   # Actions соберёт exe и создаст Release
 ```
 

@@ -67,7 +67,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.58"
+APP_VERSION = "1.59"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -384,6 +384,36 @@ def parse_result_txt(txt_content):
     return results
 
 
+# Директории (подпапки firmware_dir), в которых лежат файлы прошивок:
+#   full/  — полный образ, можно прошить как apply, так и boot;
+#   apply/ — только тип apply; boot/ — только тип boot.
+FW_SUBDIRS = ("full", "apply", "boot")
+
+
+def detect_fw_source(rel_path):
+    """Определяет директорию-источник прошивки по относительному пути.
+
+    Возвращает нормализованное имя подпапки firmware_dir ('full'/'apply'/
+    'boot') либо None, если путь не содержит известную директорию.
+    """
+    if not rel_path:
+        return None
+    parts = [p.lower() for p in re.split(r"[\\/]+", rel_path.strip()) if p]
+    for seg in parts:
+        if seg in FW_SUBDIRS:
+            return seg
+    return None
+
+
+def allowed_img_types(source):
+    """Допустимые типы прошивки для директории-источника."""
+    if source == "apply":
+        return ["apply"]
+    if source == "boot":
+        return ["boot"]
+    return ["apply", "boot"]  # full либо источник неизвестен — выбор сохраняется
+
+
 def parse_firmware_filename(filename):
     """Парсинг имени файла прошивки согласно правилам из Excel."""
     name_no_ext = os.path.splitext(filename)[0]
@@ -516,6 +546,39 @@ class OperationWorker(QThread):
     def _check_service_status(self, ssh, service_name):
         out, _ = ssh.exec_command(f"systemctl is-active {service_name}")
         return out.strip()
+
+    def _upload_selected_firmwares(self, ssh):
+        """Доказательная загрузка на устройство прошивок, выбранных в СП.
+
+        Для каждой строки plan.xml локальный файл (по rel_path из скана
+        firmware_dir) копируется в /home/user/fw_update/images/<rel_path>.
+        Отсутствие файла — ошибка операции.
+        """
+        plan_modules = parse_plan_xml(self.config['plan_xml']) \
+            if os.path.isfile(self.config.get('plan_xml', '')) else []
+        fw_by_rel = {}
+        for fw in self._scan_firmware_dir():
+            fw_by_rel[fw['rel_path']] = fw
+        uploaded = 0
+        for mod in plan_modules:
+            path = (mod.get('path') or '').replace('\\', '/')
+            rel = re.sub(r'^images/', '', path)
+            fw = fw_by_rel.get(rel)
+            if fw is None:
+                # совместимость со старыми plan.xml без подпапок
+                fname = os.path.basename(path)
+                fw = next((f for f in fw_by_rel.values() if f['filename'] == fname), None)
+            if fw is None:
+                raise Exception(
+                    f"Файл прошивки '{path}' из сценария не найден в директории "
+                    f"'{self.config.get('firmware_dir', '')}'")
+            remote = f"/home/user/fw_update/images/{fw['rel_path']}"
+            sub = os.path.dirname(fw['rel_path'])
+            ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}" if sub
+                             else "true")
+            ssh.sftp_put(fw['local_path'], remote)
+            uploaded += 1
+        self.log(f"Проверка и дозaгрузка файлов прошивок из СП: {uploaded}")
 
     def _stop_services(self, ssh):
         self.log("Остановка PrjA.service...")
@@ -835,20 +898,33 @@ class OperationWorker(QThread):
         return result
 
     def _scan_firmware_dir(self):
+        """Скан директории прошивок с учётом подпапок full/apply/boot.
+
+        Файлы ищутся в корне firmware_dir и в подпапках FW_SUBDIRS. Для каждой
+        прошивки заполняется 'source' (директория-источник) и 'rel_path'
+        (путь относительно firmware_dir, например 'full/xxx.bin').
+        """
         fw_dir = self.config.get('firmware_dir', '')
         firmwares = []
         if not fw_dir or not os.path.isdir(fw_dir):
             return firmwares
-        for filename in os.listdir(fw_dir):
-            full_path = os.path.join(fw_dir, filename)
-            if not os.path.isfile(full_path):
-                continue
-            parsed = parse_firmware_filename(filename)
-            if parsed:
-                parsed["local_path"] = full_path
-                firmwares.append(parsed)
-            else:
-                self.log(f"Предупреждение: файл '{filename}' не соответствует ожидаемому формату")
+        search_dirs = [("", fw_dir)] + [
+            (sub, os.path.join(fw_dir, sub)) for sub in FW_SUBDIRS
+            if os.path.isdir(os.path.join(fw_dir, sub))
+        ]
+        for subdir, dirpath in search_dirs:
+            for filename in sorted(os.listdir(dirpath)):
+                full_path = os.path.join(dirpath, filename)
+                if not os.path.isfile(full_path):
+                    continue
+                parsed = parse_firmware_filename(filename)
+                if parsed:
+                    parsed["local_path"] = full_path
+                    parsed["source"] = subdir if subdir else detect_fw_source(filename)
+                    parsed["rel_path"] = f"{subdir}/{filename}" if subdir else filename
+                    firmwares.append(parsed)
+                elif not subdir:
+                    self.log(f"Предупреждение: файл '{filename}' не соответствует ожидаемому формату")
         return firmwares
 
     def _op10_get_module_info(self):
@@ -903,14 +979,18 @@ class OperationWorker(QThread):
         ssh.sftp_put(agent_path, "/home/user/fw_update/IskraIO_Util")
         ssh.sftp_chmod("/home/user/fw_update/IskraIO_Util", 0o755)
         self.log("Копирование файлов прошивок...")
-        fw_dir = self.config['firmware_dir']
-        files = [f for f in os.listdir(fw_dir) if os.path.isfile(os.path.join(fw_dir, f))]
-        total = len(files)
-        for i, file in enumerate(files):
-            local_file = os.path.join(fw_dir, file)
-            ssh.sftp_put(local_file, f"/home/user/fw_update/images/{file}")
+        firmwares = self._scan_firmware_dir()
+        total = len(firmwares)
+        if total == 0:
+            raise Exception(
+                f"В директории '{self.config['firmware_dir']}' не найдено "
+                "файлов прошивок корректного формата (full_*.bin)")
+        for i, fw in enumerate(firmwares):
+            ssh.exec_command("mkdir -p /home/user/fw_update/images/" + os.path.dirname(fw["rel_path"]).replace("\\", "/"))
+            ssh.sftp_put(fw["local_path"], f"/home/user/fw_update/images/{fw['rel_path']}")
             progress = int((i + 1) / total * 100)
             self.progress_signal.emit(progress)
+        self.log(f"Загружено прошивок: {total}")
         self.log("Агент и прошивки успешно загружены")
 
     def _op2_make_plan(self, ssh):
@@ -955,6 +1035,8 @@ class OperationWorker(QThread):
         self.log("Проверка наличия агента и файлов прошивок на устройстве...")
         if not ssh.sftp_stat("/home/user/fw_update/IskraIO_Util"):
             raise Exception("Агент IskraIO_Util отсутствует. Сначала выполните 'Загрузить агента'.")
+        # Доказательная проверка/дозагрузка файлов из СП (plan.xml) перед Update
+        self._upload_selected_firmwares(ssh)
         remote_images = ssh.sftp_listdir("/home/user/fw_update/images")
         if not remote_images:
             raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Загрузить агента'.")
@@ -1138,15 +1220,12 @@ class EditSPDialog(QDialog):
     COL_DEV_VER = 5
     COL_FW_VER = 6
     COL_DATE = 7
-    COL_MARKER = 8
-    COL_MANUF = 9
-    COL_TYPE_INFO = 10
-    COL_COUNT = 11
+    COL_COUNT = 8
 
     def __init__(self, modules_info, plan_modules, firmwares, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Редактирование сценария прошивки")
-        self.resize(1400, 650)
+        self.resize(1600, 700)
         self.config = config
         self.firmwares = firmwares
         self.fw_by_type = {}
@@ -1183,7 +1262,7 @@ class EditSPDialog(QDialog):
         self.table.setColumnCount(self.COL_COUNT)
         self.table.setHorizontalHeaderLabels([
             "Выбор", "Слот", "Тип модуля", "Путь к файлу", "Тип прошивки",
-            "Версия на устройстве", "Версия в директории", "Дата", "Маркер", "Производитель", "Тип"
+            "Версия на устройстве", "Версия в директории", "Дата"
         ])
         self.table.setRowCount(len(self.rows))
 
@@ -1226,6 +1305,13 @@ class EditSPDialog(QDialog):
             browse_btn.setObjectName("browse_fw_btn")
             browse_btn.setToolTip("Выбрать файл прошивки")
             browse_btn.clicked.connect(lambda checked, idx=i: self._browse_firmware(idx))
+            if not row.get("flashable", True):
+                # Резерв широкого модуля / нет SN — путь пуст и неактивен
+                path_edit.setText("")
+                path_edit.setEnabled(False)
+                path_edit.setPlaceholderText("недоступно")
+                browse_btn.setEnabled(False)
+                row['path'] = ""
             path_layout.addWidget(path_edit)
             path_layout.addWidget(browse_btn)
             self.path_edits.append(path_edit)
@@ -1245,13 +1331,14 @@ class EditSPDialog(QDialog):
                 self.table.setItem(i, col, QTableWidgetItem("N/A"))
 
             if row['path']:
-                self._update_row(i)
+                self._find_local_fw(i)
+            self._update_row(i)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().resizeSection(self.COL_CHECK, 50)
+        self.table.horizontalHeader().resizeSection(self.COL_CHECK, 70)
         for col in [self.COL_SLOT, self.COL_TYPE, self.COL_FWTYPE, self.COL_DEV_VER,
-                    self.COL_FW_VER, self.COL_DATE, self.COL_MARKER, self.COL_MANUF, self.COL_TYPE_INFO]:
+                    self.COL_FW_VER, self.COL_DATE]:
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_PATH, QHeaderView.ResizeMode.Stretch)
         self.table.resizeRowsToContents()
@@ -1288,6 +1375,39 @@ class EditSPDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
+    def _find_local_fw(self, idx):
+        """Находит запись прошивки в self.firmwares по текущему пути строки.
+
+        Совпадение сначала по rel_path (полный относительный путь, различает
+        одноимённые файлы из разных подпапок), затем по имени файла.
+        Заполняет row['local_fw'] и row['source'].
+        """
+        row = self.rows[idx]
+        path = row.get('path', '')
+        filename = os.path.basename(path) if path else ""
+        found_fw = None
+        if filename:
+            # путь вида 'images/<file>' или 'images/<subdir>/<file>' — снимаем префикс images/
+            rel = re.sub(r'^images/', '', path.replace('\\', '/'))
+            for fw in self.firmwares:
+                if fw.get('rel_path') == rel:
+                    found_fw = fw
+                    break
+            if found_fw is None:
+                for fw in self.firmwares:
+                    if fw['filename'] == filename:
+                        found_fw = fw
+                        break
+            if found_fw is None:
+                found_fw = parse_firmware_filename(filename)
+                if found_fw:
+                    found_fw['filename'] = filename
+                    found_fw['source'] = detect_fw_source(path)
+        row['local_fw'] = found_fw
+        row['source'] = (found_fw.get('source') if found_fw else None) \
+            or detect_fw_source(path)
+        return found_fw
+
     def _browse_firmware(self, idx):
         fw_dir = self.config.get('firmware_dir', '')
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1296,20 +1416,16 @@ class EditSPDialog(QDialog):
         )
         if not file_path:
             return
-        filename = os.path.basename(file_path)
-        rel_path = f"images/{filename}"
+        try:
+            rel = os.path.relpath(file_path, fw_dir).replace("\\", "/")
+        except ValueError:
+            rel = os.path.basename(file_path)
+        if rel.startswith(".."):
+            rel = os.path.basename(file_path)
+        rel_path = f"images/{rel}"
         self.path_edits[idx].setText(rel_path)
         self.rows[idx]['path'] = rel_path
-        found_fw = None
-        for fw in self.firmwares:
-            if fw['filename'] == filename:
-                found_fw = fw
-                break
-        if found_fw is None:
-            found_fw = parse_firmware_filename(filename)
-            if found_fw:
-                found_fw['filename'] = filename
-        self.rows[idx]['local_fw'] = found_fw
+        self._find_local_fw(idx)
         self._update_row(idx)
 
     def _on_checkbox_changed(self, idx):
@@ -1318,19 +1434,35 @@ class EditSPDialog(QDialog):
     def _on_path_changed(self, idx):
         path = self.path_edits[idx].text().strip()
         self.rows[idx]['path'] = path
-        filename = os.path.basename(path) if path else ""
-        found_fw = None
-        if filename:
-            for fw in self.firmwares:
-                if fw['filename'] == filename:
-                    found_fw = fw
-                    break
-            if found_fw is None:
-                found_fw = parse_firmware_filename(filename)
-                if found_fw:
-                    found_fw['filename'] = filename
-        self.rows[idx]['local_fw'] = found_fw
+        self._find_local_fw(idx)
         self._update_row(idx)
+
+    def _apply_combo_for_source(self, idx):
+        """Ограничивает выбор 'Тип прошивки' в зависимости от директории-источника.
+
+        full  → доступны apply и boot (выбор сохраняется);
+        apply → только apply; boot → только boot;
+        пустой путь / неflashable → combo неактивен.
+        """
+        row = self.rows[idx]
+        combo = self.type_combos[idx]
+        path = self.path_edits[idx].text().strip()
+        if not path or not row.get("flashable", True):
+            combo.setEnabled(False)
+            return
+        combo.setEnabled(True)
+        allowed = allowed_img_types(row.get('source'))
+        cur = combo.currentText()
+        combo.blockSignals(True)
+        items = ["apply", "boot"]
+        combo.clear()
+        combo.addItems(items)
+        for it in items:
+            combo.model().item(combo.findText(it)).setEnabled(it in allowed)
+        target = cur if cur in allowed else allowed[0]
+        combo.setCurrentText(target)
+        row['img_type'] = target
+        combo.blockSignals(False)
 
     def _update_row(self, idx):
         row = self.rows[idx]
@@ -1339,13 +1471,11 @@ class EditSPDialog(QDialog):
         if fw:
             self.table.item(idx, self.COL_FW_VER).setText(fw.get('version', 'N/A'))
             self.table.item(idx, self.COL_DATE).setText(fw.get('date', 'N/A'))
-            self.table.item(idx, self.COL_MARKER).setText(fw.get('marker', 'N/A'))
-            self.table.item(idx, self.COL_MANUF).setText(fw.get('manufacturer', 'N/A'))
-            self.table.item(idx, self.COL_TYPE_INFO).setText(fw.get('fw_type', 'apply'))
         else:
-            for col in [self.COL_FW_VER, self.COL_DATE, self.COL_MARKER, self.COL_MANUF]:
+            for col in [self.COL_FW_VER, self.COL_DATE]:
                 self.table.item(idx, col).setText("N/A")
-            self.table.item(idx, self.COL_TYPE_INFO).setText(row.get('img_type', 'apply'))
+
+        self._apply_combo_for_source(idx)
 
         checked = self.checkboxes[idx].isChecked()
         device_ver = normalize_fw_version(row.get('device_fw_version'))
@@ -1399,19 +1529,33 @@ class EditSPDialog(QDialog):
                 return (0, 0, 0)
 
             best = max(candidates, key=ver_key)
-            rel_path = f"images/{best['filename']}"
+            rel_path = f"images/{best.get('rel_path', best['filename'])}"
             self.path_edits[i].setText(rel_path)
             row['path'] = rel_path
             row['local_fw'] = best
-            self.type_combos[i].setCurrentText(best.get('fw_type', 'apply'))
-            row['img_type'] = best.get('fw_type', 'apply')
+            row['source'] = best.get('source') or detect_fw_source(rel_path)
             self._update_row(i)
             filled += 1
         QMessageBox.information(self, "Автозаполнение", f"Заполнено путей: {filled}")
 
+    def _is_selectable(self, idx):
+        """Строка подлежит выбору: модуль прошивается и путь к файлу указан."""
+        row = self.rows[idx]
+        if not row.get("flashable", True):
+            return False
+        return bool(self.path_edits[idx].text().strip())
+
     def select_all(self):
+        """Выбирает только строки, удовлетворяющие условиям прошивки:
+        модуль доступен (есть SN, не резерв широкого модуля) и заполнен путь
+        к файлу прошивки; при совпадении версий выбор тоже снимается."""
         for i, cb in enumerate(self.checkboxes):
-            cb.setChecked(True)
+            if self._is_selectable(i):
+                cb.setChecked(True)
+            else:
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.blockSignals(False)
             self._update_row(i)
 
     def deselect_all(self):
@@ -1434,6 +1578,14 @@ class EditSPDialog(QDialog):
         if parsed['module_type'] != row['module_type'].upper():
             return False, (f"Слот {row['slot']}: прошивка '{filename}' (тип {parsed['module_type']}) "
                            f"не соответствует типу модуля {row['module_type']}")
+        # Тип прошивки должен быть допустим для директории-источника:
+        # apply/ -> только apply, boot/ -> только boot, full/ -> apply или boot.
+        source = row.get('source') or detect_fw_source(path)
+        img_type = self.type_combos[idx].currentText()
+        if img_type not in allowed_img_types(source):
+            return False, (f"Слот {row['slot']}: тип '{img_type}' недопустим для прошивки из "
+                           f"директории '{source or 'неизвестна'}' "
+                           f"(допустимо: {', '.join(allowed_img_types(source))})")
         return True, ""
 
     def apply_edit(self):

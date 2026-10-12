@@ -42,7 +42,7 @@ import importlib.util  # noqa: E402
 sys.path.insert(0, "/workspace")
 
 _spec = importlib.util.spec_from_file_location(
-    "mfc_updater", "/workspace/MFC_Module_Updater_v1.58.py")
+    "mfc_updater", "/workspace/MFC_Module_Updater_v1.59.py")
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
