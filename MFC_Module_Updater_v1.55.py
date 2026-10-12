@@ -19,13 +19,13 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Updater_v1.54.py
+    python MFC_Module_Updater_v1.55.py
 
 История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
 версию APP_VERSION и добавляйте запись в историю).
 
 Автор: Екимов Д.А. @ 2026
-Версия: 1.54
+Версия: 1.55
 """
 import html
 import http.cookiejar
@@ -67,7 +67,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.54"
+APP_VERSION = "1.55"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -445,10 +445,24 @@ def normalize_fw_version(ver):
     return ver
 
 
+
+def _resolve_module_type(info):
+    """Определяет тип модуля по записи module_info_arr.
+
+    Если module_type пустой или 'NA' (модуль не распознан по ID),
+    используется module_type_config из конфигурации креста.
+    """
+    module_type = (info.get("module_type") or "").strip() or "NA"
+    if module_type.upper() == "NA":
+        cfg = (info.get("module_type_config") or "").strip()
+        if cfg and cfg.upper() != "NA":
+            module_type = cfg
+    return module_type
+
+
 # ============================================================
 # ПОТОК ВЫПОЛНЕНИЯ ОПЕРАЦИЙ
 # ============================================================
-
 class OperationWorker(QThread):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
@@ -528,30 +542,18 @@ class OperationWorker(QThread):
         status = self._check_service_status(ssh, "PrjA.service")
         self.log(f"PrjA.service статус после запуска: {status}")
 
-    @staticmethod
-    def _resolve_module_type(info):
-        """Определяет тип модуля по записи module_info_arr.
-
-        Если module_type пустой или 'NA' (модуль не распознан по ID),
-        используется module_type_config из конфигурации креста.
-        """
-        module_type = (info.get("module_type") or "").strip() or "NA"
-        if module_type.upper() == "NA":
-            cfg = (info.get("module_type_config") or "").strip()
-            if cfg and cfg.upper() != "NA":
-                module_type = cfg
-        return module_type
 
     def _fetch_module_info(self):
         """Запрос IskraIOGetAll и построение списка установленных модулей.
 
         Соответствие записей двух массивов ответа:
-        - module_info_arr — описание слотов креста; поле 'index' может быть
-          как 0-базируемым (совпадает с позицией в массиве), так и 1-базируемым
-          (совпадает со slot_num). База определяется автоматически;
+        - module_info_arr — описание слотов креста; поле 'index' смещено
+          относительно slot_num на -1 (базовый сдвиг +1: CPU в слоте 1 имеет
+          index=0). Подозрительные альтернативы проверяются автоматически;
         - module_arr — данные установленных модулей с 'slot_num' (1-базируемый).
         Тип модуля берётся из module_info_arr (с учётом module_type_config),
-        серийный номер/версии — из module_arr.
+        серийный номер/версии — из module_arr. Модули без серийного номера
+        считаются недоступными для прошивки (см. EditSPDialog).
         """
         self.log("Получение информации о модулях через HTTP...")
         client = BackendClient(
@@ -583,19 +585,31 @@ class OperationWorker(QThread):
                  f"записей module_info_arr: {len(info_by_index)}, "
                  f"записей module_arr: {len(module_arr)}")
 
-        def build_result(index_base):
-            """Список модулей при заданной базе индексации module_info_arr.
+        # Общие словари для всех гипотез сдвига (используются оценкой конфликтов)
+        present_slots_all = set(slots)
+        mod_by_slot_all = {}
+        for _mod in module_arr:
+            if isinstance(_mod, dict) and "slot_num" in _mod:
+                _s = int(_mod["slot_num"])
+                _prev = mod_by_slot_all.get(_s)
+                if _prev is None or (not (_prev.get("serial_num") or "")
+                                     and (_mod.get("serial_num") or "")):
+                    mod_by_slot_all[_s] = _mod
 
-            slot = index - base + 1, где base=0 для 0-базируемого 'index'
-            (CPU в слоте 2 имеет index=1) и base=1 для 1-базируемого
-            (CPU в слоте 1 имеет index=1).
+        def build_result(index_shift):
+            """Список модулей при заданном сдвиге индекса module_info_arr.
+
+            slot = index + shift. По данным реального устройства поле 'index'
+            массива module_info_arr смещено относительно slot_num на -1
+            (CPU физически в слоте 1 приходит как index=0), поэтому базовый
+            сдвиг равен +1; альтернативные гипотезы проверяются автоматически.
             """
-            # Слот -> тип модуля из module_info_arr (корректировка на базу)
+            # Слот -> тип модуля из module_info_arr (корректировка на сдвиг)
             type_by_slot = {}
             for idx, info in info_by_index.items():
-                slot = idx - index_base + 1
+                slot = idx + index_shift
                 if slot > 0:
-                    type_by_slot[slot] = self._resolve_module_type(info)
+                    type_by_slot[slot] = _resolve_module_type(info)
 
             # Модули, отсутствующие в module_arr, добираем из module_info_arr
             # (например, модуль без ответов телеметрии, но сконфигурированный в кресте).
@@ -621,14 +635,17 @@ class OperationWorker(QThread):
                 mod = mod_by_slot.get(slot, {})
                 module_type = type_by_slot.get(slot, "NA")
                 source = "module_arr" if slot in present_slots else "module_info_arr"
+                serial_num = mod.get("serial_num") or "N/A"
                 rows.append({
                     "slot_num": str(slot),
                     "module_type": module_type,
-                    "serial_num": mod.get("serial_num") or "N/A",
+                    "serial_num": serial_num,
                     "manufacture_date": mod.get("manufacture_date") or "N/A",
                     "hardware_version": mod.get("hardware_version") or "N/A",
                     "firmware_version": mod.get("firmware_version") or "N/A",
                     "source": source,
+                    # Модуль доступен для прошивки только если имеет серийный номер
+                    "flashable": serial_num != "N/A",
                 })
             return rows
 
@@ -636,41 +653,72 @@ class OperationWorker(QThread):
             """Число строк с установленным (не NA) типом — метрика качества сопоставления."""
             return sum(1 for r in rows if r["module_type"].upper() != "NA")
 
-        def na_with_data(rows):
-            """Строки из module_arr (модуль отвечает), но тип не определён — признак сдвига."""
+        def serial_conflict(rows):
+            """Модули, у которых есть данные (серийный номер из module_arr),
+            но тип модуля = NA — при корректном сдвиге таких быть не должно."""
             return sum(1 for r in rows
                        if r["source"] == "module_arr"
-                       and r["module_type"].upper() == "NA"
-                       and r["serial_num"] != "N/A")
+                       and r["serial_num"] != "N/A"
+                       and r["module_type"].upper() == "NA")
 
-        # Автоопределение базы индексации module_info_arr относительно slot_num
-        # (поле 'index' у разных прошивок бэкенда бывает 0- или 1-базируемым;
-        # ошибочная база даёт смещение типов на один слот).
-        candidates = [0]
-        if indexes and min(indexes) >= 1:
-            # Индекс 0 отсутствует — вероятно, массив 1-базируемый; проверяем гипотезу.
-            candidates.append(1)
+        def type_conflict_count(shift):
+            """Число конфликтов сопоставления при заданном сдвиге.
 
-        # Приоритет: максимум распознанных типов, минимум «данные+NA», база 0 как консервативная.
-        scored = sorted(((score(build_result(b)), -na_with_data(build_result(b)), b)
-                         for b in candidates),
-                        key=lambda x: (-x[0], -x[1], x[2]))
-        index_base = scored[0][2]
+            Конфликт — модуль из module_arr с серийным номером, тип которого
+            не определён (NA) либо НЕ РАСПОЗНАН бэкендом (модуль физически
+            установлен и отвечает, но в конфигурации креста на его месте
+            пусто). При корректном сдвиге таких модулей быть не должно,
+            поэтому минимум конфликтов однозначно определяет смещение
+            (в т.ч. базовое +1 по данным реального устройства: CPU в слоте 1
+            приходит как index=0). Модули без серийного номера не учитываются:
+            они недоступны для прошивки и не дают информации о сопоставлении.
+            """
+            cnt = 0
+            for idx, info in info_by_index.items():
+                stype = _resolve_module_type(info)
+                if stype.upper() != "NA":
+                    continue  # значимая запись только у распознанных модулей
+                slot = idx + shift
+                mod = mod_by_slot_all.get(slot)
+                if (mod is not None and (mod.get("serial_num") or "")
+                        and slot not in present_slots_all):
+                    cnt += 1
+            return cnt
 
-        result = build_result(index_base)
+        # Гипотезы сдвига: базовая +1 (смещение на реальном устройстве),
+        # а также 0 и +2 — если они дают строго меньше конфликтов, выбирается
+        # лучшая гипотеза (защита от прошивок бэкенда без смещения).
+        candidates = [1]
+        min_index = min(indexes) if indexes else 1
+        for shift in (0, 2):
+            if shift not in candidates and shift >= 1 - min_index:
+                candidates.append(shift)
+
+        # Полная оценка каждой гипотезы: сначала число конфликтов, затем
+        # «ложные» непрошиваемые модули (тип распознан, а данных нет —
+        # признак неверного сопоставления), затем число распознанных типов.
+        def full_eval(shift):
+            rows = build_result(shift)
+            unflashable_named = sum(1 for r in rows
+                                    if r["source"] == "module_arr"
+                                    and not r["flashable"]
+                                    and r["module_type"].upper() != "NA")
+            return (type_conflict_count(shift), unflashable_named,
+                    -score(rows), shift, rows)
+
+        best = min(full_eval(s) for s in candidates)
+        index_shift, result = best[3], best[4]
         if len(candidates) > 1:
-            self.log(f"База индексации module_info_arr: {index_base} "
-                     f"(slot = index{' - 0' if index_base == 0 else ''} + 1)")
+            self.log(f"Сдвиг индексов module_info_arr: {index_shift} "
+                     f"(slot = index + {index_shift}; базовая гипотеза — +1)")
+        conflicts = serial_conflict(result)
+        if conflicts:
+            self.log(f"Внимание: {conflicts} модулей имеют серийный номер, "
+                     "но тип NA — проверьте соответствие слотов")
 
         for r in result:
             if r["module_type"].upper() == "NA":
                 self.log(f"Слот {r['slot_num']}: тип модуля не определён (NA)")
-
-        # Предупреждение о возможном смещении: модули с данными, но без типа.
-        warn = na_with_data(result)
-        if warn:
-            self.log(f"Внимание: {warn} модулей имеют данные, но тип NA — "
-                     "возможен сдвиг индексов между module_arr и module_info_arr")
 
         return result
 
@@ -904,7 +952,12 @@ class ModuleInfoDialog(QDialog):
         for i, mod in enumerate(modules_data):
             table.setItem(i, 0, QTableWidgetItem(mod['slot_num']))
             table.setItem(i, 1, QTableWidgetItem(mod.get('module_type', 'N/A')))
-            table.setItem(i, 2, QTableWidgetItem(mod['serial_num']))
+            serial_item = QTableWidgetItem(mod['serial_num'])
+            if not mod.get('flashable', True):
+                # Пустой серийный номер — модуль недоступен для прошивки
+                serial_item.setText(f"{mod['serial_num']} (прошивка невозможна)")
+                serial_item.setForeground(QColor("#b30000"))
+            table.setItem(i, 2, serial_item)
             table.setItem(i, 3, QTableWidgetItem(mod['manufacture_date']))
             table.setItem(i, 4, QTableWidgetItem(mod['hardware_version']))
             table.setItem(i, 5, QTableWidgetItem(mod['firmware_version']))
@@ -993,13 +1046,16 @@ class EditSPDialog(QDialog):
         for info in modules_info:
             slot = info['slot_num']
             plan = plan_by_slot.get(slot, {})
+            # Модуль без серийного номера прошить нельзя (не идентифицирован)
+            flashable = info.get('flashable', info.get('serial_num', 'N/A') != 'N/A')
             self.rows.append({
                 "slot": slot,
                 "module_type": info.get('module_type', 'NA'),
                 "device_fw_version": info.get('firmware_version', 'N/A'),
                 "path": plan.get('path', ''),
                 "img_type": plan.get('img_type', 'apply') or 'apply',
-                "local_fw": None
+                "local_fw": None,
+                "flashable": flashable,
             })
 
         layout = QVBoxLayout(self)
@@ -1018,13 +1074,25 @@ class EditSPDialog(QDialog):
 
         for i, row in enumerate(self.rows):
             cb = QCheckBox()
-            cb.setChecked(True)
+            if row.get("flashable", True):
+                cb.setChecked(True)
+            else:
+                # Нет серийного номера — прошивка модуля запрещена
+                cb.setEnabled(False)
+                cb.setToolTip("Серийный номер отсутствует — прошивка невозможна")
             cb.stateChanged.connect(lambda state, idx=i: self._on_checkbox_changed(idx))
             self.checkboxes.append(cb)
             self.table.setCellWidget(i, self.COL_CHECK, cb)
 
-            self.table.setItem(i, self.COL_SLOT, QTableWidgetItem(row['slot']))
-            self.table.setItem(i, self.COL_TYPE, QTableWidgetItem(row['module_type']))
+            slot_item = QTableWidgetItem(row['slot'])
+            type_item = QTableWidgetItem(row['module_type'])
+            if not row.get("flashable", True):
+                red = QColor("#b30000")
+                slot_item.setForeground(red)
+                type_item.setForeground(red)
+                type_item.setText(f"{row['module_type']} (нет SN)")
+            self.table.setItem(i, self.COL_SLOT, slot_item)
+            self.table.setItem(i, self.COL_TYPE, type_item)
 
             path_widget = QWidget()
             path_layout = QHBoxLayout(path_widget)
@@ -1231,6 +1299,9 @@ class EditSPDialog(QDialog):
 
     def _validate_row(self, idx):
         row = self.rows[idx]
+        if not row.get("flashable", True):
+            return False, (f"Слот {row['slot']}: серийный номер отсутствует — "
+                           f"прошивка модуля невозможна")
         path = self.path_edits[idx].text().strip()
         if not path:
             return False, f"Слот {row['slot']}: путь к файлу не указан"
@@ -1248,6 +1319,12 @@ class EditSPDialog(QDialog):
         for i, row in enumerate(self.rows):
             if not self.checkboxes[i].isChecked():
                 continue
+            if not row.get("flashable", True):
+                # Защита от программной установки галочки — модуль без SN не прошивается
+                QMessageBox.critical(
+                    self, "Ошибка валидации",
+                    f"Слот {row['slot']}: серийный номер отсутствует — прошивка невозможна")
+                return
             row['path'] = self.path_edits[i].text().strip()
             row['img_type'] = self.type_combos[i].currentText()
             ok, err = self._validate_row(i)

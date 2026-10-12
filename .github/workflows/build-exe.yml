@@ -38,32 +38,45 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Сборка exe (onefile, без консоли)
+      - name: Определение версии приложения
+        id: ver
+        shell: bash
+        run: |
+          # Версия берётся из константы APP_VERSION в исходнике — она же
+          # попадает в название .exe (требование: версия в имени файла).
+          SRC=$(ls MFC_Module_Updater_v*.py | sort -V | tail -1)
+          VER=$(python -c "import re,sys; m=re.search(r'APP_VERSION\s*=\s*[\"\x27]([\d.]+)[\"\x27]', open(sys.argv[1],encoding='utf-8').read()); print(m.group(1))" "$SRC")
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "exe=MFC_Flasher_v$VER.exe" >> "$GITHUB_OUTPUT"
+          echo "Собираем $SRC -> MFC_Flasher_v$VER.exe"
+
+      - name: Сборка exe (onefile, без консоли, версия в имени)
         shell: bash
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed \
-            --name MFC_Flasher \
-            MFC_Module_Updater_v1.54.py
+            --name "MFC_Flasher_v${{ steps.ver.outputs.version }}" \
+            "${{ steps.ver.outputs.src }}"
 
       - name: Проверка результата сборки
         shell: bash
         run: |
-          test -f dist/MFC_Flasher.exe
+          test -f "dist/${{ steps.ver.outputs.exe }}"
           ls -la dist/
 
       - name: Загрузка артефакта (для ручного запуска)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: MFC_Flasher-windows
-          path: dist/MFC_Flasher.exe
+          name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
+          path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
 
       - name: Создание релиза с .exe (при пуше тега)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MFC_Flasher.exe
+          files: dist/${{ steps.ver.outputs.exe }}
           generate_release_notes: true
           draft: false
           prerelease: false
@@ -91,6 +104,6 @@ jobs:
           curl -sf -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/octet-stream" \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=MFC_Flasher.exe" \
-            --data-binary "@dist/MFC_Flasher.exe"
-          echo "Ассет MFC_Flasher.exe загружен в релиз $TAG"
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=MFC_Flasher_v${{ steps.ver.outputs.version }}.exe" \
+            --data-binary "@dist/MFC_Flasher_v${{ steps.ver.outputs.version }}.exe"
+          echo "Ассет MFC_Flasher_v${{ steps.ver.outputs.version }}.exe загружен в релиз $TAG"
