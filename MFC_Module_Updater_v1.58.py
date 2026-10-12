@@ -19,13 +19,13 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Updater_v1.57.py
+    python MFC_Module_Updater_v1.58.py
 
 История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
 версию APP_VERSION и добавляйте запись в историю).
 
 Автор: Екимов Д.А. @ 2026
-Версия: 1.57
+Версия: 1.58
 """
 import html
 import http.cookiejar
@@ -67,7 +67,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.57"
+APP_VERSION = "1.58"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -554,21 +554,21 @@ class OperationWorker(QThread):
     def _fetch_module_info(self):
         """Запрос IskraIOGetAll и построение списка установленных модулей.
 
-        Соответствие записей двух массивов ответа:
-        - module_info_arr — описание слотов креста; поле 'index' является
-          0-базируемым номером записи (первый элемент index=0 соответствует
-          физическому слоту 1). В конце массива бэкенд может добавлять
-          «хвостовые» артефактные записи с повторным счётчиком индексов
-          (на реальном устройстве: 32 записи при crate_slot_count=21 —
-          хвост из 11 записей index 0..10 с пустыми типами). При расчёте
-          слота такие хвостовые дубликаты игнорируются: slot = index+1
-          только для index < crate_slot_count;
-        - module_arr — данные установленных модулей с 'slot_num' (1-базируемый).
-        Тип модуля берётся из module_info_arr (с учётом module_type_config),
-        серийный номер/версии — из module_arr. Если конфигурация креста не
-          описала тип слота (запись отсутствует или NA), тип доопределяется
-          по данным отвечающего модуля из module_arr. Модули без серийного
-          номера считаются недоступными для прошивки (см. EditSPDialog).
+        Семантика поля 'index' в module_info_arr (подтверждена на реальном
+        устройстве, см. CHANGELOG v1.58): это НОМЕР ФИЗИЧЕСКОГО СЛОТА
+        (1-базируемый), т.е. slot = index БЕЗ смещений:
+            {"index": 1, "module_type": "CPU", slot_count: 2} — CPU в слоте 1
+            занимает слоты 1 и 2 (следующая запись index=2 — NA-заглушка
+            резерва); index=3 — пустой слот; index=4 — DIR12 и т.д.
+        Широкие модули (slot_count > 1) описываются ОДНОЙ записью; соседние
+        слоты резерва помечаются тем же типом, но прошивка на них запрещена
+        (flashable=False), даже если формально есть серийный номер.
+        В конце массива бэкенд печатает «хвост» — повторную последовательность
+        индексов (32 записи при crate_slot_count=21, хвост index 0..10);
+        хвост отрезается по нарушению монотонности индексов.
+        Данные отвечающих модулей (serial_num, версии) берутся из module_arr
+        по полю 'slot_num' (1-базируемый). Модули без серийного номера
+        недоступны для прошивки (см. EditSPDialog).
         """
         self.log("Получение информации о модулях через HTTP...")
         client = BackendClient(
@@ -612,22 +612,19 @@ class OperationWorker(QThread):
         # Формат записи (реальное устройство):
         #   {"index": 1, "module_type": "CPU", "module_type_config": "CPU",
         #    "slot_count": 2}
-        # 'index' — 0-базируемый номер записи; физический слот = index + 1.
+        # 'index' — НОМЕР ФИЗИЧЕСКОГО СЛОТА (1-базируемый): slot = index.
+        # Запись index=0 с пустым/NA типом — артефакт бэкенда («нулевой»
+        # элемент до реальных слотов), игнорируется; если осмысленных
+        # индексов >=1 нет вовсе, применяется позиционный порядок записей.
         # Широкие модули (slot_count > 1) занимают несколько соседних слотов,
         # но описываются ОДНОЙ записью: CPU(index=1, sc=2) — это слоты 1 и 2
         # (следующая запись index=2 — NA-заглушка резерва). Соседний слот
         # резерва помечается тем же типом, но прошивка на нём запрещена.
-        # Если бэкенд ведёт «плоский» счётчик без резерва индексов (следующая
-        # осмысленная запись идёт раньше конца ширины), ширина компенсируется
-        # смещением offset. На реальном кресте: CPU → слоты 1..2; DIR12
-        # (index=4) → слот 4; DOR12(index=12) → слот 12; DIU20(index=15) →
-        # слот 15; POWER_UNIT(index=20) → слот 20 (crate_slot_count=21 ✓).
         # В конце массива бэкенд печатает «хвост» — повторную последовательность
         # индексов (на реальном устройстве: 32 записи при crate_slot_count=21,
         # хвост index 0..10). Хвост отрезается по нарушению монотонности
         # индексов; если хвостовые записи несут известные типы, они не
-        # перетирают голову. При полностью неубедительных индексах
-        # (все одинаковые) — позиционный порядок записей.
+        # перетирают голову.
         entries = [info for info in module_info_arr if isinstance(info, dict)]
 
         def _parse_idx(info):
@@ -651,49 +648,30 @@ class OperationWorker(QThread):
                 sc = 1
             return max(sc, 1)
 
-        distinct = {i for i in parsed_idx if i is not None}
+        distinct = {i for i in parsed_idx if i is not None and i >= 1}
         positional = len(distinct) <= 1 and len(entries) > 1
 
         def _head_len():
             """Длина головной части массива: записи идут в порядке слотов,
-            индексы либо строго возрастают на 1 («плоский» счётчик без
-            резерва под ширину), либо возрастают с шагом <= slot_count
-            предыдущей записи (бэкенд зарезервировал индексы под ширину).
+            индексы строго возрастают (шаг 1 либо шаг slot_count предыдущей
+            записи, если бэкенд зарезервировал индексы под ширину модуля).
             Нарушение этого порядка (повтор/уменьшение/слишком большой шаг)
-            или выход индекса за crate_slot_count — начало «хвоста»-артефакта."""
+            или выход индекса дальше конца креста — начало «хвоста»-артефакта."""
             end, p, prev_sc = 0, None, 1
-            width_extra = 0   # суммарная ширина (>1) уже пройденных модулей
             for pos, idx in enumerate(parsed_idx):
                 if idx is None:
                     continue   # пустой/отсутствующий index не задаёт слот
-                # порог по индексу учитывает ширину предыдущего модуля:
-                # бэкенд резервирует индексы под slot_count>1 (на реальном
-                # кресте CPU sc=2 на index=1..2 и запись index=20 — это ещё
-                # голова, т.к. 20 <= crate_slot_count + Σ(width-1))
-                limit = (crate_slot_count + width_extra) \
-                    if crate_slot_count is not None else None
-                if limit is not None and idx >= limit:
-                    break      # индекс за границами креста — это уже хвост
+                if crate_slot_count is not None and idx > crate_slot_count + 1:
+                    break      # индекс далеко за границами креста — это хвост
                 if p is not None:
                     step = idx - p
-                    # допустимы: шаг 1 (плоский счётчик), шаг sc предыдущей
-                    # записи (ширина внесена в индексы) и sc+sc_prev-1
-                    # (бэкенд печатает NA-заглушку резерва после широкого
-                    # модуля, как на реальном устройстве: CPU sc=2, затем
-                    # NA index=2, следующая запись index=4)
-                    max_step = max(prev_sc + _slot_count_of(entries[pos]) - 1, 1)
+                    # допустимы: шаг 1 (индексы идут подряд, резерв ширины
+                    # заполнен NA-заглушками — схема реального устройства)
+                    # и шаг sc_prev (бэкенд не печатает заглушки и резервирует
+                    # индексы под ширину широкого модуля)
+                    max_step = max(prev_sc, 1)
                     if step < 1 or step > max_step:
                         break    # повтор/уменьшение или разрыв сверх резерва
-                # ширина считается внесённой в индексы, если разрыв между
-                # предыдущим и текущим индексом больше 1 (бэкенд оставил
-                # явный резерв под slot_count>1) — такой резерв сдвигает
-                # порог «хвоста» на width_extra. При «компактной» схеме
-                # (шаг 1 через NA-заглушки, реальный крест: CPU idx=1 sc=2
-                # -> NA idx=2) ширина в индексы НЕ внесена — компенсация
-                # offset выполняется в цикле маппинга
-                if crate_slot_count is not None and p is not None \
-                        and idx - p > 1 and prev_sc > 1:
-                    width_extra += idx - p - 1
                 p = idx
                 prev_sc = _slot_count_of(entries[pos])
                 end = pos + 1
@@ -717,43 +695,51 @@ class OperationWorker(QThread):
                          f"проигнорировано: {tail_skipped} "
                          f"(голова: {head_end} записей)")
 
-        # slot = index + 1: поле 'index' — 0-базируемый номер слота
-        # (первый элемент index=0 — физический слот 1). На реальном кресте:
-        #   NA(idx=0) -> слот 1; CPU(idx=1, sc=2) -> слоты 2..3;
-        #   NA(idx=2) -> слот 3 (резерв CPU); NA(idx=3) -> слот 4 пуст;
-        #   DIR12(idx=4) -> слот 5; ... POWER_UNIT(idx=20) -> слот 21.
-        # Широкие модули (slot_count > 1) занимают несколько соседних
-        # слотов, но описываются ОДНОЙ записью. Соседние зарезервированные
-        # слоты помечаются тем же типом, но прошивка на них запрещена
-        # (flashable=False), даже если модуль отвечает серийным номером.
-        for pos in range(head_end):
-            info = entries[pos]
-            idx = parsed_idx[pos]
-            if idx is None:
-                continue          # артефактная запись без индекса
-            sc = _slot_count_of(info)
-            stype = _resolve_module_type(info)
-            newt = self._canon_type(stype)
-            slot = idx + 1
-            if crate_slot_count is not None and slot > crate_slot_count:
-                break             # дальше записи только за границами креста
-            known = self._canon_type(type_by_slot.get(slot, ""))
-            if not (known not in ("", "NA") and newt in ("", "NA")):
-                type_by_slot[slot] = stype
-            if sc > 1:
-                # резерв ширины: следующие sc-1 физических слотов
-                for inner in range(slot + 1, slot + sc):
-                    if crate_slot_count is not None \
-                            and inner > crate_slot_count:
+            # slot = index (1-базируемый номер слота). На реальном кресте:
+            #   index=0 (NA) — артефакт, пропускается;
+            #   CPU(idx=1, sc=2) -> слоты 1..2 (слот 2 — резерв);
+            #   NA(idx=3) -> слот 3 пуст; DIR12(idx=4) -> слот 4; ...
+            #   POWER_UNIT(idx=20) -> слот 20.
+            zero_skipped = False
+            for pos in range(head_end):
+                info = entries[pos]
+                idx = parsed_idx[pos]
+                if idx is None:
+                    continue          # артефактная запись без индекса
+                if idx == 0:
+                    # «нулевая» запись перед реальными слотами — артефакт
+                    # бэкенда (на реальном устройстве index=0 это NA);
+                    # осмысленные типы из нулевой записи не отображаются
+                    if not _known_type(info):
+                        zero_skipped = True
                         continue
-                    reserved_slots.add(inner)
-                    # не затираем слот, уже описанный собственной
-                    # осмысленной записью (чужой модуль)
-                    cur = self._canon_type(type_by_slot.get(inner, ""))
-                    if cur in ("", "NA"):
-                        type_by_slot[inner] = stype
+                sc = _slot_count_of(info)
+                stype = _resolve_module_type(info)
+                newt = self._canon_type(stype)
+                slot = idx
+                if crate_slot_count is not None and slot > crate_slot_count:
+                    break             # дальше записи только за границами креста
+                known = self._canon_type(type_by_slot.get(slot, ""))
+                if not (known not in ("", "NA") and newt in ("", "NA")):
+                    type_by_slot[slot] = stype
+                if sc > 1:
+                    # резерв ширины: следующие sc-1 физических слотов
+                    for inner in range(slot + 1, slot + sc):
+                        if crate_slot_count is not None \
+                                and inner > crate_slot_count:
+                            continue
+                        reserved_slots.add(inner)
+                        # не затираем слот, уже описанный собственной
+                        # осмысленной записью (чужой модуль)
+                        cur = self._canon_type(type_by_slot.get(inner, ""))
+                        if cur in ("", "NA"):
+                            type_by_slot[inner] = stype
+            if zero_skipped:
+                self.log("Запись index=0 (NA) в module_info_arr распознана "
+                         "как артефакт бэкенда и пропущена")
 
-        self.log("База индексации module_info_arr: 0 (slot = index + 1)")
+            self.log("Сопоставление слот/тип: slot = index (1-базируемый "
+                     "номер слота из module_info_arr)")
 
         self.log(f"Слотов креста: {crate_slot_count if crate_slot_count is not None else 'н/д'}, "
                  f"записей module_info_arr: {len(module_info_arr)}, "
@@ -782,9 +768,11 @@ class OperationWorker(QThread):
 
         # --- Диагностика сопоставления -------------------------------------
         # 1) Модули с серийным номером на слотах, которые конфигурация креста
-        #    не описала (тип NA) — потенциальное смещение.
+        #    не описала (тип NA) — потенциальное смещение. Резервные слоты
+        #    широких модулей в проверку не входят (там тип известен).
         mismatch_serial_na = [slot for slot, mod in sorted(mod_by_slot.items())
                               if (mod.get("serial_num") or "")
+                              and slot not in reserved_slots
                               and self._canon_type(type_by_slot.get(slot, ""))
                               in ("", "NA")]
         if mismatch_serial_na:
@@ -807,10 +795,15 @@ class OperationWorker(QThread):
                          "такого типа не отвечают")
 
         # --- Итоговые строки ------------------------------------------------
-        # Все слоты креста (1..crate_slot_count), все слоты с описанием из
-        # module_info_arr и все слоты с ответами модулей.
-        max_slot = max([crate_slot_count or 0, *type_by_slot.keys(),
-                        *mod_by_slot.keys()], default=0)
+        # Только реальные слоты креста (1..crate_slot_count), плюс слоты с
+        # ответами модулей за его пределами (если данные противоречивы).
+        max_slot = crate_slot_count
+        if max_slot is None:
+            max_slot = max([*type_by_slot.keys(), *mod_by_slot.keys()],
+                           default=len(entries))
+        # не обрезаем известные ответы модулей за границами креста
+        if mod_by_slot:
+            max_slot = max(max_slot, max(mod_by_slot.keys()))
         result = []
         for slot in range(1, max_slot + 1):
             mod = mod_by_slot.get(slot, {})
