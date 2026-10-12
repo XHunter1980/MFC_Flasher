@@ -37,12 +37,16 @@ paramiko.SSHClient = object
 paramiko.AutoAddPolicy = object
 sys.modules["paramiko"] = paramiko
 
+import glob  # noqa: E402
 import importlib.util  # noqa: E402
+import os  # noqa: E402
 
-sys.path.insert(0, "/workspace")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
-_spec = importlib.util.spec_from_file_location(
-    "mfc_updater", "/workspace/MFC_Module_Updater_v1.59.py")
+_srcs = sorted(glob.glob(os.path.join(ROOT, "MFC_Module_Updater_v*.py")))
+assert _srcs, "Исходник приложения не найден"
+_spec = importlib.util.spec_from_file_location("mfc_updater", _srcs[-1])
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 

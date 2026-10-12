@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -67,7 +68,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.59"
+APP_VERSION = "1.60"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -306,11 +307,15 @@ class BackendClient:
             self._log(f"✗ Ошибка get_token: {e}")
             raise
 
-    def request(self, req_name, params=None, login_name="", _retry_count=0):
+    def request(self, req_name, params=None, login_name="", _retry_count=0, _retry106_count=0):
         """Шаг 2: выполнение запроса с актуальным токеном и SID"""
         # ИСПРАВЛЕНИЕ: ограничение рекурсии до 3 попыток во избежание переполнения стека
         if _retry_count >= 3:
             raise Exception(f"Превышено максимальное количество попыток обновления токена (3). Проверьте лог {self.log_file}")
+        # Повтор при ошибке бэкенда result=106: ожидание 10 с, не более 3 попыток
+        if _retry106_count >= 3:
+            raise Exception(f"Бэкенд возвращает result=106 после 3 повторов (ожидание 10 с). "
+                            f"Проверьте состояние устройства, лог {self.log_file}")
 
         if self.token is None or self.sid is None:
             self.get_token()
@@ -348,6 +353,14 @@ class BackendClient:
                 self.token = None
                 self.sid = None
                 return self.request(req_name, params, login_name, _retry_count + 1)
+
+            # Ошибка бэкенда result=106 — ждём 10 секунд и повторяем запрос (до 3 попыток)
+            if data.get("result") == 106:
+                self._log(f"⚠ Бэкенд вернул result=106. Ожидание 10 с, повтор "
+                          f"{_retry106_count + 1}/3...")
+                time.sleep(10)
+                return self.request(req_name, params, login_name,
+                                    _retry_count, _retry106_count + 1)
 
             return data
 
@@ -887,8 +900,7 @@ class OperationWorker(QThread):
             serial_num = mod.get("serial_num") or "N/A"
             reserved = slot in reserved_slots
             if reserved:
-                self.log(f"Слот {slot}: резерв широкого модуля '{module_type}' — "
-                         "прошивка запрещена")
+                self.log(f"Слот {slot}: резерв '{module_type}' — прошивка запрещена")
             result.append({
                 "slot_num": str(slot),
                 "module_type": module_type,
@@ -1161,8 +1173,13 @@ class ModuleInfoDialog(QDialog):
             serial_item = QTableWidgetItem(mod['serial_num'])
             if not mod.get('flashable', True):
                 # Нет SN или резерв широкого модуля — недоступен для прошивки
-                reason = ("резерв широкого модуля" if mod.get("reserved")
-                          else "нет серийного номера")
+                mtype = (mod.get('module_type') or '').strip().upper()
+                if mod.get("reserved"):
+                    reason = "резерв"
+                elif mtype in ("", "NA"):
+                    reason = "слот пуст"
+                else:
+                    reason = "модуль отсутствует"
                 serial_item.setText(f"{mod['serial_num']} (прошивка невозможна: {reason})")
                 serial_item.setForeground(QColor("#b30000"))
             table.setItem(i, 2, serial_item)
@@ -1237,7 +1254,7 @@ class EditSPDialog(QDialog):
     def __init__(self, modules_info, plan_modules, firmwares, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Редактирование сценария прошивки")
-        self.resize(1600, 700)
+        self.resize(1600, 820)
         self.config = config
         self.firmwares = firmwares
         self.fw_by_type = {}
@@ -1256,8 +1273,14 @@ class EditSPDialog(QDialog):
             flashable = info.get('flashable', info.get('serial_num', 'N/A') != 'N/A')
             unflash_reason = ""
             if not flashable:
-                unflash_reason = ("резерв широкого модуля"
-                                  if info.get("reserved") else "нет SN")
+                # Тексты причин: 'резерв' (широкий модуль), 'слот пуст' (тип NA),
+                # 'модуль отсутствует' (тип известен, но SN нет)
+                if info.get("reserved"):
+                    unflash_reason = "резерв"
+                elif str(info.get('module_type', 'NA')).upper() in ("NA", ""):
+                    unflash_reason = "слот пуст"
+                else:
+                    unflash_reason = "модуль отсутствует"
             self.rows.append({
                 "slot": slot,
                 "module_type": info.get('module_type', 'NA'),
@@ -1372,6 +1395,20 @@ class EditSPDialog(QDialog):
         self.deselect_all_btn.setObjectName("dialog_btn_cancel")
         self.deselect_all_btn.clicked.connect(self.deselect_all)
         btn_layout.addWidget(self.deselect_all_btn)
+
+        # Массовая установка типа прошивки по всем строкам (для full-прошивок;
+        # для apply-/boot-директорий combo остаётся в допустимом состоянии)
+        self.set_apply_btn = QPushButton("apply")
+        self.set_apply_btn.setObjectName("dialog_btn_cancel")
+        self.set_apply_btn.setToolTip("Выставить тип прошивки 'apply' во всех строках")
+        self.set_apply_btn.clicked.connect(lambda: self.set_all_img_types("apply"))
+        btn_layout.addWidget(self.set_apply_btn)
+
+        self.set_boot_btn = QPushButton("boot")
+        self.set_boot_btn.setObjectName("dialog_btn_cancel")
+        self.set_boot_btn.setToolTip("Выставить тип прошивки 'boot' во всех строках")
+        self.set_boot_btn.clicked.connect(lambda: self.set_all_img_types("boot"))
+        btn_layout.addWidget(self.set_boot_btn)
 
         btn_layout.addStretch()
 
@@ -1526,6 +1563,10 @@ class EditSPDialog(QDialog):
     def autofill(self):
         filled = 0
         for i, row in enumerate(self.rows):
+            # Резервы широких модулей и недоступные для прошивки слоты
+            # автозаполнением не обрабатываются (их пути должны оставаться пустыми)
+            if not row.get("flashable", True):
+                continue
             mt = row['module_type'].upper()
             if mt in ("NA", ""):
                 continue
@@ -1548,6 +1589,10 @@ class EditSPDialog(QDialog):
             row['source'] = best.get('source') or detect_fw_source(rel_path)
             self._update_row(i)
             filled += 1
+        # После автозаполнения: сначала снять весь выбор, затем выбрать все
+        # подходящие строки (flashable + непустой путь)
+        self.deselect_all()
+        self.select_all()
         QMessageBox.information(self, "Автозаполнение", f"Заполнено путей: {filled}")
 
     def _is_selectable(self, idx):
@@ -1573,6 +1618,19 @@ class EditSPDialog(QDialog):
     def deselect_all(self):
         for i, cb in enumerate(self.checkboxes):
             cb.setChecked(False)
+            self._update_row(i)
+
+    def set_all_img_types(self, img_type):
+        """Кнопки 'apply'/'boot': выставляют тип прошивки во всех строках.
+
+        Для строк с путём из директории apply/ или boot/ значение остаётся
+        допустимым (только своим) — _apply_combo_for_source сам вернёт
+        разрешённый тип; для full-строк устанавливается выбранный тип.
+        """
+        for i in range(len(self.rows)):
+            combo = self.type_combos[i]
+            if combo.isEnabled():
+                combo.setCurrentText(img_type)
             self._update_row(i)
 
     def _validate_row(self, idx):
@@ -1624,7 +1682,8 @@ class EditSPDialog(QDialog):
             QMessageBox.warning(self, "Внимание", "Не выбрано ни одного модуля для прошивки")
             return
 
-        root = ET.Element("Plan")
+        # Корень сценария прошивки — <Root> (по требованию бэкенда; раньше был <Plan>)
+        root = ET.Element("Root")
         for row in selected:
             ET.SubElement(root, "Image", {
                 "module_slot": row['slot'],
