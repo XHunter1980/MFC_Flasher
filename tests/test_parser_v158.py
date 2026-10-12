@@ -44,7 +44,7 @@ import os  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-_srcs = sorted(glob.glob(os.path.join(ROOT, "MFC_Module_Updater_v*.py")))
+_srcs = sorted(glob.glob(os.path.join(ROOT, "MFC_Module_Flasher_v*.py")))
 assert _srcs, "Исходник приложения не найден"
 _spec = importlib.util.spec_from_file_location("mfc_updater", _srcs[-1])
 mod = importlib.util.module_from_spec(_spec)

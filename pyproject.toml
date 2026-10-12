@@ -32,6 +32,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"MFC_Module_Updater_v*.py" = [
+"MFC_Module_Flasher_v*.py" = [
     "RUF059", # unpacked-переменные stdin/stderr из paramiko exec_command — часть обязательного кортежа возврата
 ]

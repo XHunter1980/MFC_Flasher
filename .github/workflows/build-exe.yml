@@ -44,7 +44,7 @@ jobs:
         run: |
           # Версия берётся из константы APP_VERSION в исходнике — она же
           # попадает в название .exe (требование: версия в имени файла).
-          SRC=$(ls MFC_Module_Updater_v*.py | sort -V | tail -1)
+          SRC=$(ls MFC_Module_Flasher_v*.py | sort -V | tail -1)
           VER=$(python -c "import re,sys; m=re.search(r'APP_VERSION\s*=\s*[\"\x27]([\d.]+)[\"\x27]', open(sys.argv[1],encoding='utf-8').read()); print(m.group(1))" "$SRC")
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
           echo "version=$VER" >> "$GITHUB_OUTPUT"

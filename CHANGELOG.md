@@ -5,6 +5,11 @@
 (`APP_VERSION`) при каждой доработке. Начиная с v1.55 собранный `.exe` содержит
 версию в имени файла (`MFC_Flasher_v<VER>.exe`).
 
+## [1.60.1] — 2026-10-12
+
+### Изменено
+- Файл исходника переименован согласно запросу: `MFC_Module_Updater_v1.60.py` → `MFC_Module_Flasher_v1.60.py`; шаблоны путей в CI/workflow/тестах обновлены на `MFC_Module_Flasher_v*.py`.
+
 ## [1.60] — 2026-10-12
 
 ### Изменено
@@ -161,7 +166,7 @@
 - CI/CD: имя собираемого `.exe` теперь включает версию приложения —
   `MFC_Flasher_v<APP_VERSION>.exe` (workflow `build-exe.yml` читает `APP_VERSION`
   из исходника); так же именуются артефакт Actions и ассет GitHub Release.
-- Пути в `ci.yml` и `pyproject.toml` переведены на шаблон `MFC_Module_Updater_v*.py`,
+- Пути в `ci.yml` и `pyproject.toml` переведены на шаблон `MFC_Module_Flasher_v*.py`,
   чтобы CI не требовал правки при каждом инкременте версии.
 
 ## [1.54.1] — 2026-10-10
