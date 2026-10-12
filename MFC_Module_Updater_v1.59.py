@@ -550,35 +550,47 @@ class OperationWorker(QThread):
     def _upload_selected_firmwares(self, ssh):
         """Доказательная загрузка на устройство прошивок, выбранных в СП.
 
-        Для каждой строки plan.xml локальный файл (по rel_path из скана
-        firmware_dir) копируется в /home/user/fw_update/images/<rel_path>.
-        Отсутствие файла — ошибка операции.
+        Для каждой строки plan.xml проверяется наличие файла на устройстве
+        (/home/user/fw_update/images/<rel_path>); отсутствующий локальный
+        файл (по rel_path из скана firmware_dir) копируется туда. Если файла
+        нет ни на устройстве, ни локально — ошибка операции.
         """
         plan_modules = parse_plan_xml(self.config['plan_xml']) \
             if os.path.isfile(self.config.get('plan_xml', '')) else []
+        if not plan_modules:
+            self.log("Сценарий прошивки (plan.xml) пуст или отсутствует — "
+                     "проверка файлов пропускается")
+            return
         fw_by_rel = {}
         for fw in self._scan_firmware_dir():
             fw_by_rel[fw['rel_path']] = fw
         uploaded = 0
+        present = 0
         for mod in plan_modules:
             path = (mod.get('path') or '').replace('\\', '/')
             rel = re.sub(r'^images/', '', path)
+            remote = f"/home/user/fw_update/images/{rel}"
+            if ssh.sftp_stat(remote):
+                present += 1
+                continue
             fw = fw_by_rel.get(rel)
             if fw is None:
                 # совместимость со старыми plan.xml без подпапок
                 fname = os.path.basename(path)
-                fw = next((f for f in fw_by_rel.values() if f['filename'] == fname), None)
+                fw = next((f for f in fw_by_rel.values()
+                           if f['filename'] == fname), None)
             if fw is None:
                 raise Exception(
-                    f"Файл прошивки '{path}' из сценария не найден в директории "
+                    f"Файл прошивки '{path}' из сценария не найден ни на "
+                    f"устройстве, ни в директории "
                     f"'{self.config.get('firmware_dir', '')}'")
-            remote = f"/home/user/fw_update/images/{fw['rel_path']}"
             sub = os.path.dirname(fw['rel_path'])
-            ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}" if sub
-                             else "true")
+            ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}"
+                             if sub else "true")
             ssh.sftp_put(fw['local_path'], remote)
             uploaded += 1
-        self.log(f"Проверка и дозaгрузка файлов прошивок из СП: {uploaded}")
+        self.log(f"Файлы прошивок из СП: на устройстве {present}, "
+                 f"дозагружено {uploaded}")
 
     def _stop_services(self, ssh):
         self.log("Остановка PrjA.service...")
@@ -716,27 +728,27 @@ class OperationWorker(QThread):
 
         def _head_len():
             """Длина головной части массива: записи идут в порядке слотов,
-            индексы строго возрастают (шаг 1 либо шаг slot_count предыдущей
-            записи, если бэкенд зарезервировал индексы под ширину модуля).
-            Нарушение этого порядка (повтор/уменьшение/слишком большой шаг)
-            или выход индекса дальше конца креста — начало «хвоста»-артефакта."""
-            end, p, prev_sc = 0, None, 1
+            индексы строго возрастают с шагом 1 (на реальном устройстве
+            резерв ширины широких модулей заполнен NA-заглушками).
+            Первый случай, когда следующий осмысленный индекс (>=1) меньше
+            или равен предыдущему — начало «хвоста»-артефакта (повторная
+            печать счётчика от 0). Промежуточные нулевые индексы внутри
+            головы игнорируются; выход индекса за границы креста тоже
+            означает хвост."""
+            end, p = 0, None
             for pos, idx in enumerate(parsed_idx):
                 if idx is None:
                     continue   # пустой/отсутствующий index не задаёт слот
-                if crate_slot_count is not None and idx > crate_slot_count + 1:
-                    break      # индекс далеко за границами креста — это хвост
-                if p is not None:
-                    step = idx - p
-                    # допустимы: шаг 1 (индексы идут подряд, резерв ширины
-                    # заполнен NA-заглушками — схема реального устройства)
-                    # и шаг sc_prev (бэкенд не печатает заглушки и резервирует
-                    # индексы под ширину широкого модуля)
-                    max_step = max(prev_sc, 1)
-                    if step < 1 or step > max_step:
-                        break    # повтор/уменьшение или разрыв сверх резерва
+                if crate_slot_count is not None and idx > crate_slot_count:
+                    break      # индекс за границами креста — это хвост
+                if idx == 0:
+                    if p is not None:
+                        break  # нулевой индекс ПОСЛЕ реальных — повтор счётчика
+                    end = pos + 1
+                    continue   # «нулевая» запись перед головой — артефакт
+                if p is not None and idx <= p:
+                    break      # нарушение возрастания — начало хвоста
                 p = idx
-                prev_sc = _slot_count_of(entries[pos])
                 end = pos + 1
             return end
 
