@@ -67,7 +67,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.55"
+APP_VERSION = "1.56"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -547,9 +547,10 @@ class OperationWorker(QThread):
         """Запрос IskraIOGetAll и построение списка установленных модулей.
 
         Соответствие записей двух массивов ответа:
-        - module_info_arr — описание слотов креста; поле 'index' смещено
-          относительно slot_num на -1 (базовый сдвиг +1: CPU в слоте 1 имеет
-          index=0). Подозрительные альтернативы проверяются автоматически;
+        - module_info_arr — описание слотов креста; элементы упорядочены
+          слева направо, slot = порядковый номер элемента (база 1); явные
+          поля 'index' ненадёжны (пустые/дублирующиеся записи смещают
+          последовательность типов на +1) и отбрасываются при сопоставлении;
         - module_arr — данные установленных модулей с 'slot_num' (1-базируемый).
         Тип модуля берётся из module_info_arr (с учётом module_type_config),
         серийный номер/версии — из module_arr. Модули без серийного номера
@@ -570,151 +571,142 @@ class OperationWorker(QThread):
         module_info_arr = resp_data.get("module_info_arr") or []
         crate_slot_count = resp_data.get("crate_slot_count")
 
-        # Индексы из module_info_arr, отсортированные по возрастанию.
-        indexes = sorted(int(info["index"]) for info in module_info_arr
-                         if isinstance(info, dict) and "index" in info)
-        slots = sorted(int(mod["slot_num"]) for mod in module_arr
-                       if isinstance(mod, dict) and "slot_num" in mod)
-
         info_by_index = {}
+        unindexed_infos = []   # записи с пустым/некорректным 'index'
         for info in module_info_arr:
-            if isinstance(info, dict) and "index" in info:
-                info_by_index[int(info["index"])] = info
+            if not isinstance(info, dict):
+                continue
+            raw_idx = info.get("index")
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                # index отсутствует либо пришёл как '' / нечисловое значение
+                unindexed_infos.append(info)
+                continue
+            info_by_index[idx] = info
+
+        # Индексы module_info_arr могут быть ненадёжны: бэкенд добавляет к
+        # корректной последовательности записи-артефакты с index=0/'' — как
+        # правило, это ДУБЛИКАТЫ уже описанных слотов (на реальном устройстве
+        # CPU и DIR12 приходили повторно с index=0). Такие дубликаты
+        # отбрасываются: иначе они образуют «мнимый» дополнительный элемент
+        # креста и сдвигают всю последовательность типов на +1 (CPU в слоте 1
+        # отображался как NA, а типы всех модулей съезжали на соседний слот).
+        # Запись с некорректным index (пустой/<=0) считается артефактом, если
+        # её тип (module_type либо module_type_config) уже встречается среди
+        # записей с корректным index>0. Для сопоставления slot <-> тип
+        # используется ПОЗИЦИОННЫЙ порядок записей в массиве ответа (элементы
+        # идут слева направо по слотам), т.к. поле 'index' повреждено; при
+        # полном отсутствии корректных индексов сохраняется исходный порядок.
+        def _stype(info):
+            return (_resolve_module_type(info) or "").strip().upper()
+
+        valid_types = {_stype(info) for idx, info in info_by_index.items()
+                       if idx > 0 and _stype(info) not in ("", "NA")}
+        junk_indexes = [idx for idx, info in info_by_index.items()
+                        if idx <= 0 and _stype(info) in valid_types]
+        # id отброшенных записей-дубликатов (для позиционного режима)
+        _junk_entry_ids = {id(info_by_index[idx]) for idx in junk_indexes}
+        for idx in junk_indexes:
+            info_by_index.pop(idx)
+        dropped = len(junk_indexes) + len(unindexed_infos)
+        if dropped:
+            self.log(f"Отброшено невалидных записей module_info_arr "
+                     f"(index<=0 или пустой): {dropped}")
+
+        # Упорядоченный список валидных записей: позиции соответствуют
+        # физическим слотам креста слева направо. Если все корректные индексы
+        # нулевые (поле 'index' полностью повреждено) — используем исходный
+        # порядок массива ответа; иначе упорядочиваем по индексам со сдвигом
+        # до базы 1 (пропуски в последовательности индексов недопустимы —
+        # они бы снова сдвинули типы относительно слотов).
+        indexes_sorted = sorted(info_by_index)
+        use_positional_order = True
+        if indexes_sorted:
+            if all(idx == 0 for idx in indexes_sorted):
+                ordered_infos = [e for e in module_info_arr if isinstance(e, dict)]
+            else:
+                base = indexes_sorted[0]
+                expected = list(range(base, base + len(indexes_sorted)))
+                if indexes_sorted == expected:
+                    ordered_infos = [info_by_index[idx] for idx in indexes_sorted]
+                    use_positional_order = False
+                else:
+                    # индексы с пропусками/дублями — надёжнее исходный порядок
+                    ordered_infos = [e for e in module_info_arr
+                                     if isinstance(e, dict)
+                                     and id(e) not in _junk_entry_ids]
+        else:
+            ordered_infos = []
 
         self.log(f"Слотов креста: {crate_slot_count if crate_slot_count is not None else 'н/д'}, "
                  f"записей module_info_arr: {len(info_by_index)}, "
                  f"записей module_arr: {len(module_arr)}")
 
-        # Общие словари для всех гипотез сдвига (используются оценкой конфликтов)
-        present_slots_all = set(slots)
-        mod_by_slot_all = {}
+        # Слот -> данные модуля из module_arr (при дублях приоритет записи
+        # с непустым serial_num). Используется для проверки соответствия.
+        mod_by_slot = {}
         for _mod in module_arr:
             if isinstance(_mod, dict) and "slot_num" in _mod:
                 _s = int(_mod["slot_num"])
-                _prev = mod_by_slot_all.get(_s)
+                _prev = mod_by_slot.get(_s)
                 if _prev is None or (not (_prev.get("serial_num") or "")
                                      and (_mod.get("serial_num") or "")):
-                    mod_by_slot_all[_s] = _mod
+                    mod_by_slot[_s] = _mod
+        present_slots = set(mod_by_slot)
 
-        def build_result(index_shift):
-            """Список модулей при заданном сдвиге индекса module_info_arr.
+        # Сопоставление слот -> тип строится ПОЗИЦИОННО: slot = порядковый
+        # номер валидной записи (база 1). Если индексы корректны — записи
+        # уже упорядочены по ним; если повреждены — используется исходный
+        # порядок массива ответа.
+        type_by_slot = {}
+        for rank, info in enumerate(ordered_infos):
+            slot = rank + 1
+            type_by_slot[slot] = _resolve_module_type(info)
+        if use_positional_order:
+            self.log("Индексы module_info_arr повреждены — сопоставление "
+                     "слот/тип построено по порядку записей в ответе")
 
-            slot = index + shift. По данным реального устройства поле 'index'
-            массива module_info_arr смещено относительно slot_num на -1
-            (CPU физически в слоте 1 приходит как index=0), поэтому базовый
-            сдвиг равен +1; альтернативные гипотезы проверяются автоматически.
-            """
-            # Слот -> тип модуля из module_info_arr (корректировка на сдвиг)
-            type_by_slot = {}
-            for idx, info in info_by_index.items():
-                slot = idx + index_shift
-                if slot > 0:
-                    type_by_slot[slot] = _resolve_module_type(info)
+        # Проверка позиционного сопоставления по ответам модулей (module_arr):
+        # фиксируем расхождения, чтобы их было видно в журнале.
+        mismatch_serial_na = 0   # модуль отвечает, а тип на его слоте = NA
+        mismatch_unnamed = 0     # модуль отвечает, но в конфигурации слота пусто
+        for slot, mod in mod_by_slot.items():
+            if not (mod.get("serial_num") or ""):
+                continue  # без серийного номера проверка несопоставима
+            btype = type_by_slot.get(slot, "")
+            if btype.upper() in ("", "NA"):
+                if slot in type_by_slot:
+                    mismatch_serial_na += 1
+                else:
+                    mismatch_unnamed += 1
+        if mismatch_serial_na:
+            self.log(f"Внимание: {mismatch_serial_na} отвечающих модулей стоят "
+                     "на слотах с типом NA — проверьте соответствие слотов")
+        if mismatch_unnamed:
+            self.log(f"Внимание: {mismatch_unnamed} отвечающих модулей отсутствуют "
+                     "в конфигурации креста (module_info_arr короче, чем слоты)")
 
-            # Модули, отсутствующие в module_arr, добираем из module_info_arr
-            # (например, модуль без ответов телеметрии, но сконфигурированный в кресте).
-            present_slots = set(slots)
-            extra_slots = []
-            for slot, ttype in type_by_slot.items():
-                if slot not in present_slots and ttype.upper() != "NA":
-                    extra_slots.append(slot)
-            all_slots = sorted(present_slots | set(extra_slots))
-
-            mod_by_slot = {}
-            for mod in module_arr:
-                if isinstance(mod, dict) and "slot_num" in mod:
-                    s = int(mod["slot_num"])
-                    # при дублях приоритет записи с непустым serial_num
-                    prev = mod_by_slot.get(s)
-                    if prev is None or (not (prev.get("serial_num") or "")
-                                        and (mod.get("serial_num") or "")):
-                        mod_by_slot[s] = mod
-
-            rows = []
-            for slot in all_slots:
-                mod = mod_by_slot.get(slot, {})
-                module_type = type_by_slot.get(slot, "NA")
-                source = "module_arr" if slot in present_slots else "module_info_arr"
-                serial_num = mod.get("serial_num") or "N/A"
-                rows.append({
-                    "slot_num": str(slot),
-                    "module_type": module_type,
-                    "serial_num": serial_num,
-                    "manufacture_date": mod.get("manufacture_date") or "N/A",
-                    "hardware_version": mod.get("hardware_version") or "N/A",
-                    "firmware_version": mod.get("firmware_version") or "N/A",
-                    "source": source,
-                    # Модуль доступен для прошивки только если имеет серийный номер
-                    "flashable": serial_num != "N/A",
-                })
-            return rows
-
-        def score(rows):
-            """Число строк с установленным (не NA) типом — метрика качества сопоставления."""
-            return sum(1 for r in rows if r["module_type"].upper() != "NA")
-
-        def serial_conflict(rows):
-            """Модули, у которых есть данные (серийный номер из module_arr),
-            но тип модуля = NA — при корректном сдвиге таких быть не должно."""
-            return sum(1 for r in rows
-                       if r["source"] == "module_arr"
-                       and r["serial_num"] != "N/A"
-                       and r["module_type"].upper() == "NA")
-
-        def type_conflict_count(shift):
-            """Число конфликтов сопоставления при заданном сдвиге.
-
-            Конфликт — модуль из module_arr с серийным номером, тип которого
-            не определён (NA) либо НЕ РАСПОЗНАН бэкендом (модуль физически
-            установлен и отвечает, но в конфигурации креста на его месте
-            пусто). При корректном сдвиге таких модулей быть не должно,
-            поэтому минимум конфликтов однозначно определяет смещение
-            (в т.ч. базовое +1 по данным реального устройства: CPU в слоте 1
-            приходит как index=0). Модули без серийного номера не учитываются:
-            они недоступны для прошивки и не дают информации о сопоставлении.
-            """
-            cnt = 0
-            for idx, info in info_by_index.items():
-                stype = _resolve_module_type(info)
-                if stype.upper() != "NA":
-                    continue  # значимая запись только у распознанных модулей
-                slot = idx + shift
-                mod = mod_by_slot_all.get(slot)
-                if (mod is not None and (mod.get("serial_num") or "")
-                        and slot not in present_slots_all):
-                    cnt += 1
-            return cnt
-
-        # Гипотезы сдвига: базовая +1 (смещение на реальном устройстве),
-        # а также 0 и +2 — если они дают строго меньше конфликтов, выбирается
-        # лучшая гипотеза (защита от прошивок бэкенда без смещения).
-        candidates = [1]
-        min_index = min(indexes) if indexes else 1
-        for shift in (0, 2):
-            if shift not in candidates and shift >= 1 - min_index:
-                candidates.append(shift)
-
-        # Полная оценка каждой гипотезы: сначала число конфликтов, затем
-        # «ложные» непрошиваемые модули (тип распознан, а данных нет —
-        # признак неверного сопоставления), затем число распознанных типов.
-        def full_eval(shift):
-            rows = build_result(shift)
-            unflashable_named = sum(1 for r in rows
-                                    if r["source"] == "module_arr"
-                                    and not r["flashable"]
-                                    and r["module_type"].upper() != "NA")
-            return (type_conflict_count(shift), unflashable_named,
-                    -score(rows), shift, rows)
-
-        best = min(full_eval(s) for s in candidates)
-        index_shift, result = best[3], best[4]
-        if len(candidates) > 1:
-            self.log(f"Сдвиг индексов module_info_arr: {index_shift} "
-                     f"(slot = index + {index_shift}; базовая гипотеза — +1)")
-        conflicts = serial_conflict(result)
-        if conflicts:
-            self.log(f"Внимание: {conflicts} модулей имеют серийный номер, "
-                     "но тип NA — проверьте соответствие слотов")
+        # Собираем итоговые строки: все слоты с типом из конфигурации креста
+        # плюс все слоты, по которым есть ответы модулей.
+        all_slots = sorted(present_slots | set(type_by_slot))
+        result = []
+        for slot in all_slots:
+            mod = mod_by_slot.get(slot, {})
+            module_type = type_by_slot.get(slot, "NA")
+            source = "module_arr" if slot in present_slots else "module_info_arr"
+            serial_num = mod.get("serial_num") or "N/A"
+            result.append({
+                "slot_num": str(slot),
+                "module_type": module_type,
+                "serial_num": serial_num,
+                "manufacture_date": mod.get("manufacture_date") or "N/A",
+                "hardware_version": mod.get("hardware_version") or "N/A",
+                "firmware_version": mod.get("firmware_version") or "N/A",
+                "source": source,
+                # Модуль доступен для прошивки только если имеет серийный номер
+                "flashable": serial_num != "N/A",
+            })
 
         for r in result:
             if r["module_type"].upper() == "NA":
