@@ -453,7 +453,7 @@ def _resolve_module_type(info):
     используется module_type_config из конфигурации креста.
     """
     module_type = (info.get("module_type") or "").strip() or "NA"
-    if module_type.upper() == "NA":
+    if module_type.upper() in ("NA", ""):
         cfg = (info.get("module_type_config") or "").strip()
         if cfg and cfg.upper() != "NA":
             module_type = cfg
@@ -604,20 +604,30 @@ class OperationWorker(QThread):
                                  and (_mod.get("serial_num") or "")):
                 mod_by_slot[_s] = _mod
 
+        def _has_serial(mod):
+            """Есть ли у модуля серийный номер (критерий доступности прошивки)."""
+            return bool((mod or {}).get("serial_num"))
+
         # --- module_info_arr: index -> тип слота --------------------------
-        # 'index' — 0-базируемый номер слота (slot = index + 1). В конце
-        # массива бэкенд может печатать «хвост» — повторную последовательность
-        # записей с тем же счётчиком индексов (на реальном устройстве: 32
-        # записи при crate_slot_count=21; в разных логах хвост либо нёс ДУБЛИ
-        # типов CPU/DIR12/DOR12 — они создавали видимое смещение типов на +1,
-        # либо был пустым и плодил «мнимые» слоты 22..32 за пределами креста).
-        # Хвост отрезается по первому признаку: индекс перестал расти
-        # (повтор/уменьшение) либо превысил crate_slot_count. Записи головы
-        # имеют строго возрастающие индексы, поэтому нулевой индекс после
-        # ненулевого — явный признак хвоста. Индекс отсутствует/пустой только
-        # у артефактных записей (например, добавленных вручную), такие записи
-        # не задают слот и отбрасываются. Если индексы вообще неубедительны
-        # (все одинаковые) — используется позиционный порядок записей.
+        # Формат записи (реальное устройство):
+        #   {"index": 1, "module_type": "CPU", "module_type_config": "CPU",
+        #    "slot_count": 2}
+        # 'index' — 0-базируемый номер записи; физический слот = index + 1.
+        # Широкие модули (slot_count > 1) занимают несколько соседних слотов,
+        # но описываются ОДНОЙ записью: CPU(index=1, sc=2) — это слоты 1 и 2
+        # (следующая запись index=2 — NA-заглушка резерва). Соседний слот
+        # резерва помечается тем же типом, но прошивка на нём запрещена.
+        # Если бэкенд ведёт «плоский» счётчик без резерва индексов (следующая
+        # осмысленная запись идёт раньше конца ширины), ширина компенсируется
+        # смещением offset. На реальном кресте: CPU → слоты 1..2; DIR12
+        # (index=4) → слот 4; DOR12(index=12) → слот 12; DIU20(index=15) →
+        # слот 15; POWER_UNIT(index=20) → слот 20 (crate_slot_count=21 ✓).
+        # В конце массива бэкенд печатает «хвост» — повторную последовательность
+        # индексов (на реальном устройстве: 32 записи при crate_slot_count=21,
+        # хвост index 0..10). Хвост отрезается по нарушению монотонности
+        # индексов; если хвостовые записи несут известные типы, они не
+        # перетирают голову. При полностью неубедительных индексах
+        # (все одинаковые) — позиционный порядок записей.
         entries = [info for info in module_info_arr if isinstance(info, dict)]
 
         def _parse_idx(info):
@@ -631,51 +641,119 @@ class OperationWorker(QThread):
 
         parsed_idx = [_parse_idx(info) for info in entries]
 
-        cut = len(entries)          # длина валидной головы массива
-        tail_mode = "head"
+        def _known_type(info):
+            return self._canon_type(_resolve_module_type(info)) not in ("", "NA")
+
+        def _slot_count_of(info):
+            try:
+                sc = int(info.get("slot_count") or 1)
+            except (TypeError, ValueError):
+                sc = 1
+            return max(sc, 1)
+
         distinct = {i for i in parsed_idx if i is not None}
-        if len(distinct) <= 1 and len(entries) > 1:
-            # поле 'index' полностью повреждено — позиция = слот
-            tail_mode = "positional"
-        else:
-            prev = None
+        positional = len(distinct) <= 1 and len(entries) > 1
+
+        def _head_len():
+            """Длина головной части массива: записи идут в порядке слотов,
+            индексы либо строго возрастают на 1 («плоский» счётчик без
+            резерва под ширину), либо возрастают с шагом <= slot_count
+            предыдущей записи (бэкенд зарезервировал индексы под ширину).
+            Нарушение этого порядка (повтор/уменьшение/слишком большой шаг)
+            или выход индекса за crate_slot_count — начало «хвоста»-артефакта."""
+            end, p, prev_sc = 0, None, 1
+            width_extra = 0   # суммарная ширина (>1) уже пройденных модулей
             for pos, idx in enumerate(parsed_idx):
                 if idx is None:
-                    cut = pos      # пустой index — артефакт, голова закончилась
-                    break
-                if prev is not None and idx <= prev:
-                    cut = pos      # счётчик повторился — здесь начинается хвост
-                    break
-                prev = idx
-                if crate_slot_count is not None and idx >= crate_slot_count:
-                    cut = pos      # индекс вышел за границы креста
-                    break
+                    continue   # пустой/отсутствующий index не задаёт слот
+                # порог по индексу учитывает ширину предыдущего модуля:
+                # бэкенд резервирует индексы под slot_count>1 (на реальном
+                # кресте CPU sc=2 на index=1..2 и запись index=20 — это ещё
+                # голова, т.к. 20 <= crate_slot_count + Σ(width-1))
+                limit = (crate_slot_count + width_extra) \
+                    if crate_slot_count is not None else None
+                if limit is not None and idx >= limit:
+                    break      # индекс за границами креста — это уже хвост
+                if p is not None:
+                    step = idx - p
+                    # допустимы: шаг 1 (плоский счётчик), шаг sc предыдущей
+                    # записи (ширина внесена в индексы) и sc+sc_prev-1
+                    # (бэкенд печатает NA-заглушку резерва после широкого
+                    # модуля, как на реальном устройстве: CPU sc=2, затем
+                    # NA index=2, следующая запись index=4)
+                    max_step = max(prev_sc + _slot_count_of(entries[pos]) - 1, 1)
+                    if step < 1 or step > max_step:
+                        break    # повтор/уменьшение или разрыв сверх резерва
+                # ширина считается внесённой в индексы, если разрыв между
+                # предыдущим и текущим индексом больше 1 (бэкенд оставил
+                # явный резерв под slot_count>1) — такой резерв сдвигает
+                # порог «хвоста» на width_extra. При «компактной» схеме
+                # (шаг 1 через NA-заглушки, реальный крест: CPU idx=1 sc=2
+                # -> NA idx=2) ширина в индексы НЕ внесена — компенсация
+                # offset выполняется в цикле маппинга
+                if crate_slot_count is not None and p is not None \
+                        and idx - p > 1 and prev_sc > 1:
+                    width_extra += idx - p - 1
+                p = idx
+                prev_sc = _slot_count_of(entries[pos])
+                end = pos + 1
+            return end
 
+        head_end = _head_len()
+
+        # --- Маппинг index -> физический слот ------------------------------
         type_by_slot = {}
-        if tail_mode == "positional":
+        reserved_slots = set()   # резерв широких модулей (прошивать нельзя)
+        if positional:
+            # поле 'index' полностью повреждено — позиция записи = слот
             self.log("Индексы module_info_arr неубедительны — сопоставление "
                      "слот/тип построено по порядку записей в ответе")
-            for rank, info in enumerate(entries[:cut]):
+            for rank, info in enumerate(entries):
                 type_by_slot[rank + 1] = _resolve_module_type(info)
         else:
-            tail_skipped = len(entries) - cut
+            tail_skipped = len(entries) - head_end
             if tail_skipped:
-                self.log(f"Отрезан хвостовых артефактных записей "
-                         f"module_info_arr (повтор счётчика индексов/"
-                         f"выход за crate_slot_count): {tail_skipped}")
-            for info in entries[:cut]:
-                try:
-                    idx = int(info.get("index"))
-                except (TypeError, ValueError):
-                    continue
-                slot = idx + 1
-                stype = _resolve_module_type(info)
-                # Запись с распознанным типом не затирается дублем NA/пустым
-                known = self._canon_type(type_by_slot.get(slot, ""))
-                new = self._canon_type(stype)
-                if known not in ("", "NA") and new in ("", "NA"):
-                    continue
+                self.log(f"Хвостовых артефактных записей module_info_arr "
+                         f"проигнорировано: {tail_skipped} "
+                         f"(голова: {head_end} записей)")
+
+        # slot = index + 1: поле 'index' — 0-базируемый номер слота
+        # (первый элемент index=0 — физический слот 1). На реальном кресте:
+        #   NA(idx=0) -> слот 1; CPU(idx=1, sc=2) -> слоты 2..3;
+        #   NA(idx=2) -> слот 3 (резерв CPU); NA(idx=3) -> слот 4 пуст;
+        #   DIR12(idx=4) -> слот 5; ... POWER_UNIT(idx=20) -> слот 21.
+        # Широкие модули (slot_count > 1) занимают несколько соседних
+        # слотов, но описываются ОДНОЙ записью. Соседние зарезервированные
+        # слоты помечаются тем же типом, но прошивка на них запрещена
+        # (flashable=False), даже если модуль отвечает серийным номером.
+        for pos in range(head_end):
+            info = entries[pos]
+            idx = parsed_idx[pos]
+            if idx is None:
+                continue          # артефактная запись без индекса
+            sc = _slot_count_of(info)
+            stype = _resolve_module_type(info)
+            newt = self._canon_type(stype)
+            slot = idx + 1
+            if crate_slot_count is not None and slot > crate_slot_count:
+                break             # дальше записи только за границами креста
+            known = self._canon_type(type_by_slot.get(slot, ""))
+            if not (known not in ("", "NA") and newt in ("", "NA")):
                 type_by_slot[slot] = stype
+            if sc > 1:
+                # резерв ширины: следующие sc-1 физических слотов
+                for inner in range(slot + 1, slot + sc):
+                    if crate_slot_count is not None \
+                            and inner > crate_slot_count:
+                        continue
+                    reserved_slots.add(inner)
+                    # не затираем слот, уже описанный собственной
+                    # осмысленной записью (чужой модуль)
+                    cur = self._canon_type(type_by_slot.get(inner, ""))
+                    if cur in ("", "NA"):
+                        type_by_slot[inner] = stype
+
+        self.log("База индексации module_info_arr: 0 (slot = index + 1)")
 
         self.log(f"Слотов креста: {crate_slot_count if crate_slot_count is not None else 'н/д'}, "
                  f"записей module_info_arr: {len(module_info_arr)}, "
@@ -739,16 +817,22 @@ class OperationWorker(QThread):
             module_type = type_by_slot.get(slot, "NA")
             source = "module_arr" if slot in mod_by_slot else "module_info_arr"
             serial_num = mod.get("serial_num") or "N/A"
+            reserved = slot in reserved_slots
+            if reserved:
+                self.log(f"Слот {slot}: резерв широкого модуля '{module_type}' — "
+                         "прошивка запрещена")
             result.append({
                 "slot_num": str(slot),
                 "module_type": module_type,
+                "reserved": reserved,
                 "serial_num": serial_num,
                 "manufacture_date": mod.get("manufacture_date") or "N/A",
                 "hardware_version": mod.get("hardware_version") or "N/A",
                 "firmware_version": mod.get("firmware_version") or "N/A",
                 "source": source,
-                # Модуль доступен для прошивки только если имеет серийный номер
-                "flashable": serial_num != "N/A",
+                # Модуль доступен для прошивки только если имеет серийный
+                # номер И не является резервом широкого модуля (slot_count>1)
+                "flashable": serial_num != "N/A" and not reserved,
             })
 
         for r in result:
@@ -989,8 +1073,10 @@ class ModuleInfoDialog(QDialog):
             table.setItem(i, 1, QTableWidgetItem(mod.get('module_type', 'N/A')))
             serial_item = QTableWidgetItem(mod['serial_num'])
             if not mod.get('flashable', True):
-                # Пустой серийный номер — модуль недоступен для прошивки
-                serial_item.setText(f"{mod['serial_num']} (прошивка невозможна)")
+                # Нет SN или резерв широкого модуля — недоступен для прошивки
+                reason = ("резерв широкого модуля" if mod.get("reserved")
+                          else "нет серийного номера")
+                serial_item.setText(f"{mod['serial_num']} (прошивка невозможна: {reason})")
                 serial_item.setForeground(QColor("#b30000"))
             table.setItem(i, 2, serial_item)
             table.setItem(i, 3, QTableWidgetItem(mod['manufacture_date']))
@@ -1081,8 +1167,13 @@ class EditSPDialog(QDialog):
         for info in modules_info:
             slot = info['slot_num']
             plan = plan_by_slot.get(slot, {})
-            # Модуль без серийного номера прошить нельзя (не идентифицирован)
+            # Модуль без серийного номера прошить нельзя (не идентифицирован);
+            # резерв широкого модуля (slot_count>1) — тоже нельзя
             flashable = info.get('flashable', info.get('serial_num', 'N/A') != 'N/A')
+            unflash_reason = ""
+            if not flashable:
+                unflash_reason = ("резерв широкого модуля"
+                                  if info.get("reserved") else "нет SN")
             self.rows.append({
                 "slot": slot,
                 "module_type": info.get('module_type', 'NA'),
@@ -1091,6 +1182,7 @@ class EditSPDialog(QDialog):
                 "img_type": plan.get('img_type', 'apply') or 'apply',
                 "local_fw": None,
                 "flashable": flashable,
+                "unflash_reason": unflash_reason,
             })
 
         layout = QVBoxLayout(self)
@@ -1112,9 +1204,10 @@ class EditSPDialog(QDialog):
             if row.get("flashable", True):
                 cb.setChecked(True)
             else:
-                # Нет серийного номера — прошивка модуля запрещена
+                # Нет серийного номера / резерв широкого модуля — прошивка запрещена
                 cb.setEnabled(False)
-                cb.setToolTip("Серийный номер отсутствует — прошивка невозможна")
+                reason = row.get("unflash_reason") or "прошивка невозможна"
+                cb.setToolTip(f"Прошивка невозможна: {reason}")
             cb.stateChanged.connect(lambda state, idx=i: self._on_checkbox_changed(idx))
             self.checkboxes.append(cb)
             self.table.setCellWidget(i, self.COL_CHECK, cb)
@@ -1125,7 +1218,8 @@ class EditSPDialog(QDialog):
                 red = QColor("#b30000")
                 slot_item.setForeground(red)
                 type_item.setForeground(red)
-                type_item.setText(f"{row['module_type']} (нет SN)")
+                reason = row.get("unflash_reason") or "прошивка невозможна"
+                type_item.setText(f"{row['module_type']} ({reason})")
             self.table.setItem(i, self.COL_SLOT, slot_item)
             self.table.setItem(i, self.COL_TYPE, type_item)
 
@@ -1335,8 +1429,8 @@ class EditSPDialog(QDialog):
     def _validate_row(self, idx):
         row = self.rows[idx]
         if not row.get("flashable", True):
-            return False, (f"Слот {row['slot']}: серийный номер отсутствует — "
-                           f"прошивка модуля невозможна")
+            reason = row.get("unflash_reason") or "прошивка невозможна"
+            return False, f"Слот {row['slot']}: {reason} — прошивка модуля запрещена"
         path = self.path_edits[idx].text().strip()
         if not path:
             return False, f"Слот {row['slot']}: путь к файлу не указан"
@@ -1355,10 +1449,11 @@ class EditSPDialog(QDialog):
             if not self.checkboxes[i].isChecked():
                 continue
             if not row.get("flashable", True):
-                # Защита от программной установки галочки — модуль без SN не прошивается
+                # Защита от программной установки галочки — такой модуль не прошивается
+                reason = row.get("unflash_reason") or "прошивка невозможна"
                 QMessageBox.critical(
                     self, "Ошибка валидации",
-                    f"Слот {row['slot']}: серийный номер отсутствует — прошивка невозможна")
+                    f"Слот {row['slot']}: {reason} — прошивка невозможна")
                 return
             row['path'] = self.path_edits[i].text().strip()
             row['img_type'] = self.type_combos[i].currentText()
