@@ -612,16 +612,18 @@ class OperationWorker(QThread):
         # типов CPU/DIR12/DOR12 — они создавали видимое смещение типов на +1,
         # либо был пустым и плодил «мнимые» слоты 22..32 за пределами креста).
         # Хвост отрезается по первому признаку: индекс перестал расти
-        # (повтор/уменьшение) либо превысил crate_slot_count. Записи головы с
-        # корректным индексом всегда имеют непустой 'index', поэтому нулевой
-        # индекс после ненулевого — явный признак хвоста. Если индексы вообще
-        # неубедительны (все нули и т.п.) — используется позиционный порядок.
+        # (повтор/уменьшение) либо превысил crate_slot_count. Записи головы
+        # имеют строго возрастающие индексы, поэтому нулевой индекс после
+        # ненулевого — явный признак хвоста. Индекс отсутствует/пустой только
+        # у артефактных записей (например, добавленных вручную), такие записи
+        # не задают слот и отбрасываются. Если индексы вообще неубедительны
+        # (все одинаковые) — используется позиционный порядок записей.
         entries = [info for info in module_info_arr if isinstance(info, dict)]
 
         def _parse_idx(info):
             raw = info.get("index")
             if raw is None or (isinstance(raw, str) and not raw.strip()):
-                return None   # индекс отсутствует/пустой — не участвует в детекте
+                return None   # индекс отсутствует/пустой — не задаёт слот
             try:
                 return int(raw)
             except (TypeError, ValueError):
@@ -639,9 +641,9 @@ class OperationWorker(QThread):
             prev = None
             for pos, idx in enumerate(parsed_idx):
                 if idx is None:
-                    continue
-                if prev is not None and (idx <= prev
-                                         or (prev > 0 and idx == 0)):
+                    cut = pos      # пустой index — артефакт, голова закончилась
+                    break
+                if prev is not None and idx <= prev:
                     cut = pos      # счётчик повторился — здесь начинается хвост
                     break
                 prev = idx
