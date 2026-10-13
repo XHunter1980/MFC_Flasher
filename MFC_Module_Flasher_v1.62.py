@@ -27,6 +27,7 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
 Автор: Екимов Д.А. @ 2026
 Версия: 1.58
 """
+import glob
 import html
 import http.cookiejar
 import json
@@ -68,7 +69,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.61"
+APP_VERSION = "1.62"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -78,7 +79,8 @@ DEFAULT_CONFIG = {
     "agent_dir": "",
     "firmware_dir": "",
     "plan_xml": "",
-    "api_path": "/vx3/backend.fcgi"
+    "api_path": "/vx3/backend.fcgi",
+    "ignore_restrictions": False,
 }
 
 STYLESHEET = """
@@ -372,7 +374,8 @@ class BackendClient:
 def normalize_img_type(value):
     """Приводит тип образа из plan.xml к внутреннему значению ('apply'/'boot').
 
-    В файле сценария тип apply записывается как 'appl' (требование бэкенда),
+    В файле сценария и в UI тип apply отображается/записывается как 'appl'
+    (требование бэкенда),
     при чтении обратно значение восстанавливается.
     """
     v = (value or '').strip().lower()
@@ -409,10 +412,93 @@ def parse_result_txt(txt_content):
     return results
 
 
+# Строки-маркеры ошибок в operation.log (регистронезависимая проверка)
+OP_LOG_ERROR_MARKERS = ("===ERROR===", "state[Error]", "Error]")
+
+
+def analyze_operation_log(log_path):
+    """Анализ operation.log после прошивки.
+
+    Различает три состояния для каждого слота из файла сценария (plan.xml):
+      'ok'               — есть запись 'slot=N ...: Complete';
+      'error'            — в логе найдена ошибка по слоту
+                           ('===ERROR===' или 'Update module slot=N "<тип>": <текст>');
+      'no_information'   — ни успешной записи, ни ошибки (информации нет).
+
+    Возвращает {slot(str): {'status': ..., 'detail': текст_ошибки}}.
+    """
+    analysis = {}
+    try:
+        with open(log_path, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return analysis
+    lines = content.splitlines()
+
+    # 1) Успешные завершения и явные строки результатов по слотам
+    res_pat = re.compile(r'slot=(\d+)\s+"([^"]*)":\s*(.*)')
+    for line in lines:
+        m = res_pat.search(line)
+        if not m:
+            continue
+        slot = m.group(1)
+        text = m.group(3).strip()
+        if "Complete" in text:
+            analysis[slot] = {"status": "ok", "detail": ""}
+        elif text:
+            # непустой текст результата — считаем ошибкой
+            analysis[slot] = {"status": "error", "detail": text}
+
+    # 2) Ошибочные фреймы/состояния: привязываем к ближайшему slot=N выше по логу
+    has_err_block = any(mark.lower() in line.lower() for line in lines
+                        for mark in OP_LOG_ERROR_MARKERS)
+    slot_pat = re.compile(r'slot=(\d+)')
+    cur_slot = None
+    err_pat = re.compile(r'===ERROR===|state\[Error\]', re.IGNORECASE)
+    for line in lines:
+        sm = slot_pat.search(line)
+        if sm:
+            cur_slot = sm.group(1)
+        if err_pat.search(line) and cur_slot is not None:
+            if analysis.get(cur_slot, {}).get("status") != "ok":
+                analysis.setdefault(cur_slot, {"status": "error", "detail": ""})
+    # 3) Финальные строки вида 'Update module slot=4 "DIR12": ' (даже пустые — это ошибка)
+    upd_pat = re.compile(r'Update module slot=(\d+)\s+"([^"]*)":\s*(.*)')
+    for line in lines:
+        m = upd_pat.search(line)
+        if not m:
+            continue
+        slot = m.group(1)
+        text = m.group(3).strip()
+        if has_err_block or text:
+            prev = analysis.get(slot)
+            if not prev or prev["status"] != "ok":
+                analysis[slot] = {"status": "error", "detail": text or "ошибка (см. operation.log)"}
+    return analysis
+
+
+def find_latest_operation_log(agent_dir):
+    """Последний выгруженный operation_log_*.log в директории агента."""
+    if not agent_dir or not os.path.isdir(agent_dir):
+        return None
+    logs = sorted(glob.glob(os.path.join(agent_dir, "operation_log_*.log")))
+    return logs[-1] if logs else None
+
+
 # Директории (подпапки firmware_dir), в которых лежат файлы прошивок:
-#   full/  — полный образ, можно прошить как apply, так и boot;
-#   apply/ — только тип apply; boot/ — только тип boot.
-FW_SUBDIRS = ("full", "apply", "boot")
+#   full/  — полный образ, можно прошить как appl, так и boot;
+#   appl/  — только тип appl; boot/ — только тип boot.
+# Внутреннее значение типа 'appl' исторически именуется 'apply'; наружу
+# (в UI и plan.xml) всегда отображается/записывается 'appl'.
+FW_SUBDIRS = ("full", "apply", "appl", "boot")
+
+# Отображаемое имя внутреннего типа прошивки 'apply'
+IMG_TYPE_DISPLAY = {"apply": "appl"}
+
+
+def display_img_type(value):
+    """Внутренний тип ('apply'/'boot') -> отображаемый ('appl'/'boot')."""
+    return IMG_TYPE_DISPLAY.get(value, value)
 
 
 def detect_fw_source(rel_path):
@@ -420,18 +506,19 @@ def detect_fw_source(rel_path):
 
     Возвращает нормализованное имя подпапки firmware_dir ('full'/'apply'/
     'boot') либо None, если путь не содержит известную директорию.
+    Подпапка 'appl' нормализуется к внутреннему значению 'apply'.
     """
     if not rel_path:
         return None
     parts = [p.lower() for p in re.split(r"[\\/]+", rel_path.strip()) if p]
     for seg in parts:
         if seg in FW_SUBDIRS:
-            return seg
+            return "apply" if seg == "appl" else seg
     return None
 
 
 def allowed_img_types(source):
-    """Допустимые типы прошивки для директории-источника."""
+    """Допустимые внутренние типы прошивки для директории-источника."""
     if source == "apply":
         return ["apply"]
     if source == "boot":
@@ -439,14 +526,77 @@ def allowed_img_types(source):
     return ["apply", "boot"]  # full либо источник неизвестен — выбор сохраняется
 
 
+def agent_work_dir(agent_path_value):
+    """Каталог для локальных артефактов (логи, выгрузки) из пути к агенту.
+
+    С v1.62 поле 'agent_dir' хранит полный путь к ФАЙЛУ агента; рабочие
+    файлы складываются в каталог рядом с ним. Для обратной совместимости
+    значение, являющееся существующей директорией, используется как есть.
+    """
+    if not agent_path_value:
+        return ""
+    if os.path.isdir(agent_path_value):
+        return agent_path_value
+    return os.path.dirname(agent_path_value) or "."
+
+
+def agent_executable(agent_path_value):
+    """Путь к исполняемому файлу агента из значения поля 'agent_dir'.
+
+    Обратная совместимость: если пользователь указал директорию —
+    возвращается <dir>/IskraIO_Util; если файл — этот файл.
+    """
+    if not agent_path_value:
+        return ""
+    if os.path.isdir(agent_path_value):
+        return os.path.join(agent_path_value, "IskraIO_Util")
+    return agent_path_value
+
+
+def fw_name_format(filename):
+    """Формат имени файла прошивки по префиксу директории/имени.
+
+    Правила (требования заказчика):
+      - допустимые префиксы: 'appl', 'boot', 'full' (регистронезависимо);
+      - 'full' — формат пока не поддерживается;
+      - имя без известного префикса — некорректный формат.
+
+    Возвращает кортеж (fmt, ok, supported, warning):
+      fmt       — распознанный префикс ('appl'/'boot'/'full'/None);
+      ok        — префикс корректен (один из appl/boot/full);
+      supported — прошивка файлом разрешена при выключенной опции
+                  «Игнорировать ограничения» (ok и не 'full');
+      warning   — текст предупреждения или None.
+    """
+    base = os.path.basename((filename or '').replace('\\', '/')).lower()
+    for prefix in ("appl", "boot", "full"):
+        if base.startswith(prefix):
+            if prefix == "full":
+                return ("full", True, False,
+                        f"Файл '{filename}' имеет формат full — "
+                        "такой формат пока не поддерживается")
+            return (prefix, True, True, None)
+    return (None, False, False,
+            f"Файл '{filename}' имеет некорректное имя: ожидается начало "
+            "'appl', 'boot' или 'full'")
+
+
 def parse_firmware_filename(filename):
-    """Парсинг имени файла прошивки согласно правилам из Excel."""
+    """Парсинг имени файла прошивки согласно правилам из Excel.
+
+    Поддерживаются два формата: старый 'full_<...>' (7 частей) и новый
+    '<appl|boot>_<маркер>_<тип>_<произв>_R<вер>_<дата>_<...>' — в этом
+    случае префикс имени возвращается в поле 'name_prefix'.
+    """
     name_no_ext = os.path.splitext(filename)[0]
     parts = name_no_ext.split('_')
 
-    if len(parts) != 7 or parts[0] != 'full':
+    if len(parts) < 7:
+        return None
+    if parts[0] not in ('full', 'appl', 'boot'):
         return None
 
+    name_prefix = parts[0]
     marker_raw = parts[1]
     type_raw = parts[2]
     ver_major_raw = parts[4]
@@ -482,7 +632,8 @@ def parse_firmware_filename(filename):
         "module_type": module_type,
         "version": version,
         "date": date_str,
-        "fw_type": "apply",
+        "fw_type": "apply" if name_prefix != "boot" else "boot",
+        "name_prefix": name_prefix,
         "marker": marker,
         "manufacturer": marker,
         "filename": filename
@@ -585,7 +736,7 @@ class OperationWorker(QThread):
         if not plan_modules:
             self.log("Сценарий прошивки (plan.xml) пуст или отсутствует — "
                      "проверка файлов пропускается")
-            return
+            return []
         fw_by_rel = {}
         for fw in self._scan_firmware_dir():
             fw_by_rel[fw['rel_path']] = fw
@@ -616,6 +767,8 @@ class OperationWorker(QThread):
             uploaded += 1
         self.log(f"Файлы прошивок из СП: на устройстве {present}, "
                  f"дозагружено {uploaded}")
+        # Возвращаем слоты из сценария — нужны для анализа operation.log
+        return [m['slot'] for m in plan_modules]
 
     def _stop_services(self, ssh):
         self.log("Остановка PrjA.service...")
@@ -1009,7 +1162,7 @@ class OperationWorker(QThread):
         ssh.exec_command("rm -rf /home/user/fw_update")
         ssh.exec_command("mkdir -p /home/user/fw_update/images")
         self.log("Загрузка агента IskraIO_Util...")
-        agent_path = os.path.join(self.config['agent_dir'], "IskraIO_Util")
+        agent_path = agent_executable(self.config['agent_dir'])
         if not os.path.exists(agent_path):
             raise FileNotFoundError(f"Файл агента не найден: {agent_path}")
         ssh.sftp_put(agent_path, "/home/user/fw_update/IskraIO_Util")
@@ -1020,7 +1173,31 @@ class OperationWorker(QThread):
         if total == 0:
             raise Exception(
                 f"В директории '{self.config['firmware_dir']}' не найдено "
-                "файлов прошивок корректного формата (full_*.bin)")
+                "файлов прошивок (ожидаются имена с префиксом appl_/boot_/full_)")
+        # Проверка формата имён перед загрузкой: предупреждаем, но грузим
+        bad_names = []
+        full_names = []
+        for fw in firmwares:
+            fmt, ok, supported, warning = fw_name_format(fw['filename'])
+            if warning:
+                self.log(f"Предупреждение: {warning}")
+            if not ok:
+                bad_names.append(fw['filename'])
+            elif fmt == 'full':
+                full_names.append(fw['filename'])
+        if bad_names or full_names:
+            msg_lines = []
+            if bad_names:
+                msg_lines.append(
+                    "Некорректные имена (без префикса appl/boot/full):\n  "
+                    + "\n  ".join(bad_names))
+            if full_names:
+                msg_lines.append(
+                    "Формат full пока НЕ поддерживается:\n  "
+                    + "\n  ".join(full_names))
+            msg_lines.append("\nЗагрузка на устройство будет выполнена.")
+            self.log("ВНИМАНИЕ: " + " | ".join(
+                m.replace("\n", " ") for m in msg_lines))
         for i, fw in enumerate(firmwares):
             ssh.exec_command("mkdir -p /home/user/fw_update/images/" + os.path.dirname(fw["rel_path"]).replace("\\", "/"))
             ssh.sftp_put(fw["local_path"], f"/home/user/fw_update/images/{fw['rel_path']}")
@@ -1062,7 +1239,7 @@ class OperationWorker(QThread):
     def _op4_export_plan(self, ssh):
         self.log("Выгрузка plan.xml...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_path = os.path.join(self.config['agent_dir'], f"plan_export_{timestamp}.xml")
+        local_path = os.path.join(agent_work_dir(self.config['agent_dir']), f"plan_export_{timestamp}.xml")
         ssh.sftp_get("/home/user/fw_update/plan.xml", local_path)
         self.progress_signal.emit(100)
         self.log(f"Сценарий выгружен в: {local_path}")
@@ -1072,7 +1249,7 @@ class OperationWorker(QThread):
         if not ssh.sftp_stat("/home/user/fw_update/IskraIO_Util"):
             raise Exception("Агент IskraIO_Util отсутствует. Сначала выполните 'Загрузить агента'.")
         # Доказательная проверка/дозагрузка файлов из СП (plan.xml) перед Update
-        self._upload_selected_firmwares(ssh)
+        plan_slots = self._upload_selected_firmwares(ssh)
         remote_images = ssh.sftp_listdir("/home/user/fw_update/images")
         if not remote_images:
             raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Загрузить агента'.")
@@ -1093,7 +1270,7 @@ class OperationWorker(QThread):
 
             self.log("Выгрузка operation.log...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            local_log = os.path.join(self.config['agent_dir'], f"operation_log_{timestamp}.log")
+            local_log = os.path.join(agent_work_dir(self.config['agent_dir']), f"operation_log_{timestamp}.log")
             ssh.sftp_get("/home/user/fw_update/operation.log", local_log)
 
             self.log("Анализ result.txt...")
@@ -1105,6 +1282,24 @@ class OperationWorker(QThread):
                     self.log(f"Слот {slot}: Успешно")
                 else:
                     self.log(f"Слот {slot}: Ошибка - {status}")
+            # Анализ operation.log: различаем 'нет информации' и 'ошибка'
+            try:
+                op_analysis = analyze_operation_log(local_log)
+                for slot in sorted(op_analysis, key=int):
+                    st = op_analysis[slot]
+                    if st["status"] == "ok":
+                        continue
+                    if st["status"] == "error":
+                        detail = st.get("detail") or "ошибка (см. operation.log)"
+                        self.log(f"operation.log, слот {slot}: ОШИБКА - {detail}")
+                    else:
+                        self.log(f"operation.log, слот {slot}: нет информации")
+                analyzed_slots = set(op_analysis)
+                for mod_slot in plan_slots:
+                    if mod_slot not in analyzed_slots:
+                        self.log(f"operation.log, слот {mod_slot}: нет информации")
+            except Exception as e:
+                self.log(f"Не удалось проанализировать operation.log: {e}")
         except Exception as e:
             self.log(f"Ошибка во время прошивки: {e}")
             raise
@@ -1114,7 +1309,7 @@ class OperationWorker(QThread):
     def _op7_download_dump(self, ssh):
         self.log("Выгрузка дампа операции...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_dump = os.path.join(self.config['agent_dir'], f"io_can_box2_{timestamp}.csv")
+        local_dump = os.path.join(agent_work_dir(self.config['agent_dir']), f"io_can_box2_{timestamp}.csv")
         ssh.sftp_get("/home/user/fw_update/io.can.box2.csv", local_dump)
         self.progress_signal.emit(100)
         self.log(f"Дамп выгружен в: {local_dump}")
@@ -1129,6 +1324,32 @@ class OperationWorker(QThread):
         stdin, stdout, stderr = ssh.client.exec_command("cat /home/user/fw_update/result.txt")
         result_content = stdout.read().decode()
         results = parse_result_txt(result_content)
+        # Анализ operation.log (локального выгруженного или с устройства):
+        # различаем 'нет информации' и 'ошибка'
+        log_path = find_latest_operation_log(agent_work_dir(self.config.get('agent_dir', '')))
+        if log_path is None:
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".log") as tmp:
+                    log_path = tmp.name
+                ssh.sftp_get("/home/user/fw_update/operation.log", log_path)
+            except Exception as e:
+                self.log(f"Не удалось получить operation.log: {e}")
+                log_path = None
+        op_analysis = analyze_operation_log(log_path) if log_path else {}
+        for slot, st in sorted(op_analysis.items(), key=lambda x: int(x[0])):
+            if st["status"] == "error":
+                self.log(f"operation.log, слот {slot}: ОШИБКА - "
+                         f"{st.get('detail') or 'см. operation.log'}")
+        # Дополняем результат по слотам из СП: нет записи -> 'нет информации'
+        for mod in modules:
+            slot = mod['slot']
+            st = op_analysis.get(slot)
+            if st and st["status"] == "error":
+                results[slot] = f"Ошибка: {st.get('detail') or 'см. operation.log'}"
+            elif st and st["status"] == "ok":
+                results.setdefault(slot, "Complete")
+            elif slot not in results:
+                results[slot] = "__NO_INFO__"
         self.progress_signal.emit(100)
         self.finished_signal.emit(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result"})
 
@@ -1192,7 +1413,8 @@ class ModuleInfoDialog(QDialog):
                     reason = "слот пуст"
                 else:
                     reason = "модуль отсутствует"
-                serial_item.setText(f"{mod['serial_num']} (прошивка невозможна: {reason})")
+                # Вместо 'N/A (прошивка невозможна: ...)' — короткая причина
+                serial_item.setText(reason)
                 serial_item.setForeground(QColor("#b30000"))
             table.setItem(i, 2, serial_item)
             table.setItem(i, 3, QTableWidgetItem(mod['manufacture_date']))
@@ -1228,10 +1450,20 @@ class ViewResultDialog(QDialog):
             table.setItem(i, 0, QTableWidgetItem(mod['slot']))
             table.setItem(i, 1, QTableWidgetItem(mod['type']))
             table.setItem(i, 2, QTableWidgetItem(mod['path']))
-            table.setItem(i, 3, QTableWidgetItem(mod['img_type']))
-            res = results.get(mod['slot'], "Нет данных / Ошибка")
+            # Внутренний тип 'apply' отображается как 'appl' (как в plan.xml)
+            img_type_item = "appl" if mod['img_type'] == "apply" else mod['img_type']
+            table.setItem(i, 3, QTableWidgetItem(img_type_item))
+            res_raw = results.get(mod['slot'], "__NO_INFO__")
+            if res_raw == "__NO_INFO__":
+                res = "Нет информации"
+            elif "Complete" in res_raw:
+                res = res_raw
+            else:
+                res = res_raw if res_raw.startswith("Ошибка") else f"Ошибка: {res_raw}"
             item = QTableWidgetItem(res)
-            if "Complete" not in res:
+            if res_raw == "__NO_INFO__":
+                item.setForeground(QColor("#666666"))
+            elif "Complete" not in res_raw:
                 item.setForeground(QColor("#b30000"))
             else:
                 item.setForeground(QColor("#006600"))
@@ -1366,9 +1598,11 @@ class EditSPDialog(QDialog):
             self.table.setCellWidget(i, self.COL_PATH, path_widget)
 
             combo = QComboBox()
-            combo.addItems(["apply", "boot"])
-            combo.setCurrentText(row['img_type'])
-            combo.currentTextChanged.connect(lambda text, idx=i: self._update_row(idx))
+            # Внутренние значения ('apply'/'boot'), отображаемые — 'appl'/'boot'
+            combo.addItem(display_img_type("apply"), "apply")
+            combo.addItem(display_img_type("boot"), "boot")
+            combo.setCurrentIndex(0 if row['img_type'] == "apply" else 1)
+            combo.currentIndexChanged.connect(lambda _idx, i=i: self._update_row(i))
             self.type_combos.append(combo)
             self.table.setCellWidget(i, self.COL_FWTYPE, combo)
 
@@ -1409,10 +1643,10 @@ class EditSPDialog(QDialog):
         btn_layout.addWidget(self.deselect_all_btn)
 
         # Массовая установка типа прошивки по всем строкам (для full-прошивок;
-        # для apply-/boot-директорий combo остаётся в допустимом состоянии)
-        self.set_apply_btn = QPushButton("apply")
+        # для appl-/boot-директорий combo остаётся в допустимом состоянии)
+        self.set_apply_btn = QPushButton("appl")
         self.set_apply_btn.setObjectName("dialog_btn_cancel")
-        self.set_apply_btn.setToolTip("Выставить тип прошивки 'apply' во всех строках")
+        self.set_apply_btn.setToolTip("Выставить тип прошивки 'appl' во всех строках")
         self.set_apply_btn.clicked.connect(lambda: self.set_all_img_types("apply"))
         btn_layout.addWidget(self.set_apply_btn)
 
@@ -1501,8 +1735,8 @@ class EditSPDialog(QDialog):
     def _apply_combo_for_source(self, idx):
         """Ограничивает выбор 'Тип прошивки' в зависимости от директории-источника.
 
-        full  → доступны apply и boot (выбор сохраняется);
-        apply → только apply; boot → только boot;
+        full  → доступны appl и boot (выбор сохраняется);
+        appl → только appl; boot → только boot;
         пустой путь / неflashable → combo неактивен.
         """
         row = self.rows[idx]
@@ -1513,15 +1747,12 @@ class EditSPDialog(QDialog):
             return
         combo.setEnabled(True)
         allowed = allowed_img_types(row.get('source'))
-        cur = combo.currentText()
+        cur = combo.currentData()
         combo.blockSignals(True)
-        items = ["apply", "boot"]
-        combo.clear()
-        combo.addItems(items)
-        for it in items:
-            combo.model().item(combo.findText(it)).setEnabled(it in allowed)
+        for i in range(combo.count()):
+            combo.setItemEnabled(i, combo.itemData(i) in allowed)
         target = cur if cur in allowed else allowed[0]
-        combo.setCurrentText(target)
+        combo.setCurrentIndex(combo.findData(target))
         row['img_type'] = target
         combo.blockSignals(False)
 
@@ -1633,16 +1864,18 @@ class EditSPDialog(QDialog):
             self._update_row(i)
 
     def set_all_img_types(self, img_type):
-        """Кнопки 'apply'/'boot': выставляют тип прошивки во всех строках.
+        """Кнопки 'appl'/'boot': выставляют тип прошивки во всех строках.
 
-        Для строк с путём из директории apply/ или boot/ значение остаётся
+        Для строк с путём из директории appl/ или boot/ значение остаётся
         допустимым (только своим) — _apply_combo_for_source сам вернёт
         разрешённый тип; для full-строк устанавливается выбранный тип.
         """
         for i in range(len(self.rows)):
             combo = self.type_combos[i]
             if combo.isEnabled():
-                combo.setCurrentText(img_type)
+                idx = combo.findData(img_type)
+                if idx >= 0 and combo.model().item(idx).flags() is not None:
+                    combo.setCurrentIndex(idx)
             self._update_row(i)
 
     def _validate_row(self, idx):
@@ -1663,11 +1896,11 @@ class EditSPDialog(QDialog):
         # Тип прошивки должен быть допустим для директории-источника:
         # apply/ -> только apply, boot/ -> только boot, full/ -> apply или boot.
         source = row.get('source') or detect_fw_source(path)
-        img_type = self.type_combos[idx].currentText()
+        img_type = self.type_combos[idx].currentData()
         if img_type not in allowed_img_types(source):
-            return False, (f"Слот {row['slot']}: тип '{img_type}' недопустим для прошивки из "
+            return False, (f"Слот {row['slot']}: тип '{display_img_type(img_type)}' недопустим для прошивки из "
                            f"директории '{source or 'неизвестна'}' "
-                           f"(допустимо: {', '.join(allowed_img_types(source))})")
+                           f"(допустимо: {', '.join(display_img_type(t) for t in allowed_img_types(source))})")
         return True, ""
 
     def apply_edit(self):
@@ -1683,7 +1916,7 @@ class EditSPDialog(QDialog):
                     f"Слот {row['slot']}: {reason} — прошивка невозможна")
                 return
             row['path'] = self.path_edits[i].text().strip()
-            row['img_type'] = self.type_combos[i].currentText()
+            row['img_type'] = self.type_combos[i].currentData()
             ok, err = self._validate_row(i)
             if not ok:
                 QMessageBox.critical(self, "Ошибка валидации", err)
@@ -1749,12 +1982,13 @@ class MainWindow(QMainWindow):
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         conn_layout.addWidget(self.pass_edit, 0, 3)
-        conn_layout.addWidget(QLabel("Директория агента:"), 1, 0)
+        conn_layout.addWidget(QLabel("Файл агента:"), 1, 0)
         self.agent_edit = QLineEdit()
+        self.agent_edit.setPlaceholderText("Полный путь к файлу IskraIO_Util")
         conn_layout.addWidget(self.agent_edit, 1, 1, 1, 2)
         self.agent_btn = QPushButton("Обзор...")
         self.agent_btn.setObjectName("browse_btn")
-        self.agent_btn.clicked.connect(lambda: self.browse_dir(self.agent_edit))
+        self.agent_btn.clicked.connect(self.browse_agent_file)
         conn_layout.addWidget(self.agent_btn, 1, 3)
         conn_layout.addWidget(QLabel("Директория прошивок:"), 2, 0)
         self.fw_edit = QLineEdit()
@@ -1774,6 +2008,18 @@ class MainWindow(QMainWindow):
         self.api_path_edit = QLineEdit()
         self.api_path_edit.setPlaceholderText("/vx3/backend.fcgi")
         conn_layout.addWidget(self.api_path_edit, 4, 1, 1, 2)
+        # Опция «Игнорировать ограничения» (по умолчанию выключена):
+        # включённая разрешает прошивку файлами с некорректными именами и
+        # форматом full; выключенная — только корректно названными appl/boot.
+        self.ignore_restrict_cb = QCheckBox(
+            "Игнорировать ограничения (разрешить файлы с некорректными"
+            " именами и формат full)")
+        self.ignore_restrict_cb.setToolTip(
+            "По умолчанию выключена: прошивка выполняется только файлами,\n"
+            "имена которых начинаются с 'appl' или 'boot'. Формат 'full'\n"
+            "пока не поддерживается. При включении ограничения по имени\n"
+            "файла игнорируются, включая формат full.")
+        conn_layout.addWidget(self.ignore_restrict_cb, 5, 0, 1, 4)
         conn_group.setLayout(conn_layout)
         main_layout.addWidget(conn_group)
 
@@ -1834,6 +2080,18 @@ class MainWindow(QMainWindow):
             line_edit.setText(dir_path)
             self.save_config()
 
+    def browse_agent_file(self):
+        """Выбор файла агента (не директории) — требование v1.62."""
+        start_dir = ""
+        cur = self.agent_edit.text().strip()
+        if cur:
+            start_dir = os.path.dirname(cur) or cur
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл агента IskraIO_Util", start_dir, "")
+        if file_path:
+            self.agent_edit.setText(file_path)
+            self.save_config()
+
     def browse_file(self, line_edit):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", "", "XML Files (*.xml)")
         if file_path:
@@ -1853,7 +2111,8 @@ class MainWindow(QMainWindow):
             "agent_dir": self.agent_edit.text(),
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
-            "api_path": self.api_path_edit.text()
+            "api_path": self.api_path_edit.text(),
+            "ignore_restrictions": self.ignore_restrict_cb.isChecked()
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
@@ -1865,6 +2124,7 @@ class MainWindow(QMainWindow):
         self.fw_edit.setText(self.config.get("firmware_dir", ""))
         self.plan_edit.setText(self.config.get("plan_xml", ""))
         self.api_path_edit.setText(self.config.get("api_path", "/vx3/backend.fcgi"))
+        self.ignore_restrict_cb.setChecked(bool(self.config.get("ignore_restrictions", False)))
 
     def append_log(self, msg):
         color = "#000000"
@@ -1894,7 +2154,8 @@ class MainWindow(QMainWindow):
             "agent_dir": self.agent_edit.text(),
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
-            "api_path": self.api_path_edit.text()
+            "api_path": self.api_path_edit.text(),
+            "ignore_restrictions": self.ignore_restrict_cb.isChecked()
         }
 
     def check_remote_dir_exists(self, path):
