@@ -69,7 +69,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.63"
+APP_VERSION = "1.64"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -761,15 +761,19 @@ class OperationWorker(QThread):
                     f"устройстве, ни в директории "
                     f"'{self.config.get('firmware_dir', '')}'")
             # Контроль формата прошивок (по умолчанию включён): файлы, не
-            # прошедшие проверку, на устройство не дозагружаются.
-            if bool(self.config.get('format_control', True)):
-                _fmt, _ok, _supported, warning = fw_name_format(fw['filename'])
-                if not _supported:
+            # прошедшие проверку, на устройство не дозагружаются; при
+            # отключённом контроле — только предупреждение, дозагрузка
+            # выполняется (включая формат full).
+            _fmt, _ok, _supported, warning = fw_name_format(fw['filename'])
+            if not _supported:
+                if bool(self.config.get('format_control', True)):
                     raise Exception(
                         f"Файл прошивки '{fw['filename']}' из сценария не "
                         f"прошёл контроль формата ({warning or 'формат недопустим'}). "
                         f"Отключите опцию «Контроль формата прошивок», чтобы "
                         f"разрешить загрузку")
+                if warning:
+                    self.log(f"Предупреждение: {warning}")
             sub = os.path.dirname(fw['rel_path'])
             ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}"
                              if sub else "true")
@@ -1097,33 +1101,65 @@ class OperationWorker(QThread):
         return result
 
     def _scan_firmware_dir(self):
-        """Скан директории прошивок с учётом подпапок full/apply/boot.
+        """Скан директории прошивок с учётом подпапок full/apply/appl/boot.
 
-        Файлы ищутся в корне firmware_dir и в подпапках FW_SUBDIRS. Для каждой
-        прошивки заполняется 'source' (директория-источник) и 'rel_path'
-        (путь относительно firmware_dir, например 'full/xxx.bin').
+        Файлы ищутся рекурсивно в firmware_dir (включая подпапки). Формат
+        имени проверяется по префиксу ('appl', 'boot', 'full') — см.
+        fw_name_format; строгий разбор полного имени (версия/дата) не
+        требуется для загрузки и потому не блокирует файл: если разбился
+        parse_firmware_filename, поля заполняются из имени минимально.
+        Для каждой прошивки заполняется 'source' (директория-источник) и
+        'rel_path' (путь относительно firmware_dir, например 'full/xxx.bin').
         """
         fw_dir = self.config.get('firmware_dir', '')
         firmwares = []
         if not fw_dir or not os.path.isdir(fw_dir):
             return firmwares
-        search_dirs = [("", fw_dir)] + [
-            (sub, os.path.join(fw_dir, sub)) for sub in FW_SUBDIRS
-            if os.path.isdir(os.path.join(fw_dir, sub))
-        ]
-        for subdir, dirpath in search_dirs:
-            for filename in sorted(os.listdir(dirpath)):
-                full_path = os.path.join(dirpath, filename)
-                if not os.path.isfile(full_path):
+        for root, _dirs, files in os.walk(fw_dir):
+            rel_dir = os.path.relpath(root, fw_dir).replace("\\", "/")
+            subdir = "" if rel_dir == "." else rel_dir
+            for filename in sorted(files):
+                full_path = os.path.join(root, filename)
+                fmt, ok, _supported, warning = fw_name_format(filename)
+                if not ok:
+                    # Файлы с некорректным именем (без префикса appl/boot/full)
+                    # в скан не попадают; для .bin — предупреждение, остальные
+                    # файлы (конфиги, readme и т.п.) пропускаются молча.
+                    if filename.lower().endswith(".bin"):
+                        self.log(f"Предупреждение: {warning}")
                     continue
                 parsed = parse_firmware_filename(filename)
-                if parsed:
-                    parsed["local_path"] = full_path
-                    parsed["source"] = subdir if subdir else detect_fw_source(filename)
-                    parsed["rel_path"] = f"{subdir}/{filename}" if subdir else filename
-                    firmwares.append(parsed)
-                elif not subdir:
-                    self.log(f"Предупреждение: файл '{filename}' не соответствует ожидаемому формату")
+                if parsed is None:
+                    # Имя корректного формата, но не проходит строгий шаблон
+                    # (например appl_atb3500_ai8_r.bin) — берём тип из префикса,
+                    # остальное определяем по возможности.
+                    parts = os.path.splitext(filename)[0].split("_")
+                    module_type = parts[2].upper() if len(parts) > 2 else "N/A"
+                    if module_type == "PSU":
+                        module_type = "POWER_UNIT"
+                    ver = "N/A"
+                    for p_ in parts[3:]:
+                        if re.match(r"^R\d+$", p_, re.I):
+                            idx = parts.index(p_)
+                            if idx + 1 < len(parts) and parts[idx + 1].isdigit():
+                                ver = f"R {p_[1:]}.{parts[idx + 1]}"
+                            break
+                    parsed = {
+                        "module_type": module_type,
+                        "version": ver,
+                        "date": "N/A",
+                        "fw_type": "boot" if fmt == "boot" else "apply",
+                        "name_prefix": fmt,
+                        "marker": parts[1].upper() if len(parts) > 1 else "N/A",
+                        "manufacturer": parts[1].upper() if len(parts) > 1 else "N/A",
+                        "filename": filename,
+                    }
+                parsed["local_path"] = full_path
+                parsed["source"] = detect_fw_source(subdir) or \
+                    detect_fw_source(filename) or ("full" if fmt == "full" else
+                                                   ("boot" if fmt == "boot" else "apply"))
+                parsed["rel_path"] = f"{subdir}/{filename}" if subdir else filename
+                firmwares.append(parsed)
         return firmwares
 
     def _op10_get_module_info(self):
@@ -1189,6 +1225,7 @@ class OperationWorker(QThread):
         # не загружаются; при отключённой — только предупреждения, загрузка
         # выполняется (включая формат full).
         fc_on = bool(self.config.get('format_control', True))
+        all_count = len(firmwares)
         bad_names = []
         full_names = []
         kept = []
@@ -1229,12 +1266,15 @@ class OperationWorker(QThread):
                 "После контроля формата не осталось допустимых файлов "
                 "прошивок для загрузки (отключите опцию «Контроль формата "
                 "прошивок», если загрузка таких файлов необходима)")
+        loaded = 0
         for i, fw in enumerate(firmwares):
             ssh.exec_command("mkdir -p /home/user/fw_update/images/" + os.path.dirname(fw["rel_path"]).replace("\\", "/"))
             ssh.sftp_put(fw["local_path"], f"/home/user/fw_update/images/{fw['rel_path']}")
+            loaded += 1
             progress = int((i + 1) / total * 100)
             self.progress_signal.emit(progress)
-        self.log(f"Загружено прошивок: {total}")
+        skipped_note = f", пропущено контролем формата: {skipped}" if skipped else ""
+        self.log(f"Загружено прошивок: {loaded} из {all_count}{skipped_note}")
         self.log("Агент и прошивки успешно загружены")
 
     def _op2_make_plan(self, ssh):
