@@ -6,7 +6,7 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     контроллера (МФК) через SSH/SFTP-агента IskraIO_Util и HTTP-бэкенд устройства.
 
 Возможности:
-    - Загрузка агента и файлов прошивок на устройство (операция 1);
+    - Внедрение агента и файлов прошивок на устройство с контролем формата (операция 1);
     - Создание сценария прошивки MakePlan (операция 2);
     - Импорт/экспорт сценария plan.xml (операции 3, 4);
     - Запуск прошивки Update с анализом result.txt (операция 6);
@@ -69,7 +69,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.62"
+APP_VERSION = "1.63"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
     "firmware_dir": "",
     "plan_xml": "",
     "api_path": "/vx3/backend.fcgi",
-    "ignore_restrictions": False,
+    "format_control": True,
 }
 
 STYLESHEET = """
@@ -564,8 +564,8 @@ def fw_name_format(filename):
     Возвращает кортеж (fmt, ok, supported, warning):
       fmt       — распознанный префикс ('appl'/'boot'/'full'/None);
       ok        — префикс корректен (один из appl/boot/full);
-      supported — прошивка файлом разрешена при выключенной опции
-                  «Игнорировать ограничения» (ok и не 'full');
+      supported — прошивка файлом разрешена при включённой опции
+                  «Контроль формата прошивок» (ok и не 'full');
       warning   — текст предупреждения или None.
     """
     base = os.path.basename((filename or '').replace('\\', '/')).lower()
@@ -760,6 +760,16 @@ class OperationWorker(QThread):
                     f"Файл прошивки '{path}' из сценария не найден ни на "
                     f"устройстве, ни в директории "
                     f"'{self.config.get('firmware_dir', '')}'")
+            # Контроль формата прошивок (по умолчанию включён): файлы, не
+            # прошедшие проверку, на устройство не дозагружаются.
+            if bool(self.config.get('format_control', True)):
+                _fmt, _ok, _supported, warning = fw_name_format(fw['filename'])
+                if not _supported:
+                    raise Exception(
+                        f"Файл прошивки '{fw['filename']}' из сценария не "
+                        f"прошёл контроль формата ({warning or 'формат недопустим'}). "
+                        f"Отключите опцию «Контроль формата прошивок», чтобы "
+                        f"разрешить загрузку")
             sub = os.path.dirname(fw['rel_path'])
             ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}"
                              if sub else "true")
@@ -1174,9 +1184,14 @@ class OperationWorker(QThread):
             raise Exception(
                 f"В директории '{self.config['firmware_dir']}' не найдено "
                 "файлов прошивок (ожидаются имена с префиксом appl_/boot_/full_)")
-        # Проверка формата имён перед загрузкой: предупреждаем, но грузим
+        # Контроль формата прошивок (опция «Контроль формата прошивок»,
+        # по умолчанию включена): не прошедшие контроль файлы на устройство
+        # не загружаются; при отключённой — только предупреждения, загрузка
+        # выполняется (включая формат full).
+        fc_on = bool(self.config.get('format_control', True))
         bad_names = []
         full_names = []
+        kept = []
         for fw in firmwares:
             fmt, ok, supported, warning = fw_name_format(fw['filename'])
             if warning:
@@ -1185,6 +1200,10 @@ class OperationWorker(QThread):
                 bad_names.append(fw['filename'])
             elif fmt == 'full':
                 full_names.append(fw['filename'])
+            if fc_on and not supported:
+                continue
+            kept.append(fw)
+        skipped = len(firmwares) - len(kept)
         if bad_names or full_names:
             msg_lines = []
             if bad_names:
@@ -1195,9 +1214,21 @@ class OperationWorker(QThread):
                 msg_lines.append(
                     "Формат full пока НЕ поддерживается:\n  "
                     + "\n  ".join(full_names))
-            msg_lines.append("\nЗагрузка на устройство будет выполнена.")
+            if fc_on:
+                msg_lines.append(
+                    f"\nКонтроль формата включен: эти файлы НЕ будут "
+                    f"загружены на устройство (пропущено: {skipped}).")
+            else:
+                msg_lines.append("\nЗагрузка на устройство будет выполнена.")
             self.log("ВНИМАНИЕ: " + " | ".join(
                 m.replace("\n", " ") for m in msg_lines))
+        firmwares = kept
+        total = len(firmwares)
+        if total == 0:
+            raise Exception(
+                "После контроля формата не осталось допустимых файлов "
+                "прошивок для загрузки (отключите опцию «Контроль формата "
+                "прошивок», если загрузка таких файлов необходима)")
         for i, fw in enumerate(firmwares):
             ssh.exec_command("mkdir -p /home/user/fw_update/images/" + os.path.dirname(fw["rel_path"]).replace("\\", "/"))
             ssh.sftp_put(fw["local_path"], f"/home/user/fw_update/images/{fw['rel_path']}")
@@ -1247,12 +1278,12 @@ class OperationWorker(QThread):
     def _op6_update(self, ssh):
         self.log("Проверка наличия агента и файлов прошивок на устройстве...")
         if not ssh.sftp_stat("/home/user/fw_update/IskraIO_Util"):
-            raise Exception("Агент IskraIO_Util отсутствует. Сначала выполните 'Загрузить агента'.")
+            raise Exception("Агент IskraIO_Util отсутствует. Сначала выполните 'Внедрить агента и прошивки'.")
         # Доказательная проверка/дозагрузка файлов из СП (plan.xml) перед Update
         plan_slots = self._upload_selected_firmwares(ssh)
         remote_images = ssh.sftp_listdir("/home/user/fw_update/images")
         if not remote_images:
-            raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Загрузить агента'.")
+            raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Внедрить агента и прошивки'.")
         self.log(f"Найдено файлов прошивок на устройстве: {len(remote_images)}")
 
         try:
@@ -1839,11 +1870,41 @@ class EditSPDialog(QDialog):
         QMessageBox.information(self, "Автозаполнение", f"Заполнено путей: {filled}")
 
     def _is_selectable(self, idx):
-        """Строка подлежит выбору: модуль прошивается и путь к файлу указан."""
+        """Строка подлежит выбору: модуль прошивается, путь к файлу указан и
+        (при включённом контроле формата) файл прошёл проверку формата."""
         row = self.rows[idx]
         if not row.get("flashable", True):
             return False
-        return bool(self.path_edits[idx].text().strip())
+        path = self.path_edits[idx].text().strip()
+        if not path:
+            return False
+        if not self._format_ok(path):
+            return False
+        return True
+
+    def _format_ok(self, path):
+        """Прохождение контроля формата имени файла прошивки.
+
+        Использует результат скана firmware_dir (row['local_fw']), если он
+        есть; иначе — префикс имени файла. При отключённой опции
+        «Контроль формата прошивок» всегда возвращает True.
+        """
+        if bool(self.config.get('format_control', True)):
+            return bool(self.fw_format_supported(path))
+        return True
+
+    def fw_format_supported(self, path):
+        """supported-флаг формата файла (см. fw_name_format) с учётом
+        результата скана локальной директории прошивок."""
+        row = None
+        for i in range(len(self.rows)):
+            if self.path_edits[i].text().strip() == path:
+                row = self.rows[i]
+                break
+        fw = (row or {}).get('local_fw')
+        filename = os.path.basename((fw or {}).get('filename') or path)
+        _, _, supported, _warning = fw_name_format(filename)
+        return supported
 
     def select_all(self):
         """Выбирает только строки, удовлетворяющие условиям прошивки:
@@ -1887,7 +1948,19 @@ class EditSPDialog(QDialog):
         if not path:
             return False, f"Слот {row['slot']}: путь к файлу не указан"
         filename = os.path.basename(path)
+        # Контроль формата прошивок (по умолчанию включён): запрещает
+        # сохранение в СП файлов с некорректными именами и формат full.
+        if bool(self.config.get('format_control', True)) \
+                and not self._format_ok(path):
+            _fmt, ok_prefix, _sup, warning = fw_name_format(filename)
+            return False, (f"Слот {row['slot']}: "
+                           f"{warning or 'файл не прошёл контроль формата'}")
         parsed = parse_firmware_filename(filename)
+        if parsed is None and not bool(self.config.get('format_control', True)):
+            # без контроля формата достаточно корректного префикса имени
+            _fmt, ok_prefix, _sup, warning = fw_name_format(filename)
+            if not ok_prefix:
+                return False, (f"Слот {row['slot']}: {warning}")
         if parsed is None:
             return False, f"Слот {row['slot']}: файл '{filename}' не соответствует формату имени прошивки"
         if parsed['module_type'] != row['module_type'].upper():
@@ -2008,25 +2081,28 @@ class MainWindow(QMainWindow):
         self.api_path_edit = QLineEdit()
         self.api_path_edit.setPlaceholderText("/vx3/backend.fcgi")
         conn_layout.addWidget(self.api_path_edit, 4, 1, 1, 2)
-        # Опция «Игнорировать ограничения» (по умолчанию выключена):
-        # включённая разрешает прошивку файлами с некорректными именами и
-        # форматом full; выключенная — только корректно названными appl/boot.
-        self.ignore_restrict_cb = QCheckBox(
-            "Игнорировать ограничения (разрешить файлы с некорректными"
-            " именами и формат full)")
-        self.ignore_restrict_cb.setToolTip(
-            "По умолчанию выключена: прошивка выполняется только файлами,\n"
-            "имена которых начинаются с 'appl' или 'boot'. Формат 'full'\n"
-            "пока не поддерживается. При включении ограничения по имени\n"
-            "файла игнорируются, включая формат full.")
-        conn_layout.addWidget(self.ignore_restrict_cb, 5, 0, 1, 4)
+        # Опция «Контроль формата прошивок» (по умолчанию включена):
+        # при включённой прошивки, не прошедшие контроль формата имени,
+        # на устройство не загружаются и модули ими не прошиваются;
+        # при отключённой выводятся предупреждения, но загрузка/прошивка
+        # выполняются (включая формат full).
+        self.format_control_cb = QCheckBox(
+            "Контроль формата прошивок (не загружать и не прошивать"
+            " файлы с некорректными именами и формат full)")
+        self.format_control_cb.setToolTip(
+            "По умолчанию включена: файлы, имена которых не начинаются\n"
+            "с 'appl' или 'boot' (а также неподдерживаемый формат 'full'),\n"
+            "на устройство не загружаются и прошивка ими запрещена.\n"
+            "При отключении ограничения снимаются: выводятся только\n"
+            "предупреждения, загрузка и прошивка выполняются.")
+        conn_layout.addWidget(self.format_control_cb, 5, 0, 1, 4)
         conn_group.setLayout(conn_layout)
         main_layout.addWidget(conn_group)
 
         ops_group = QGroupBox("Операции")
         ops_layout = QGridLayout()
         col1_ops = [
-            (1, "Загрузить агента", "col1_btn_1"),
+            (1, "Внедрить агента и прошивки", "col1_btn_1"),
             (10, "Информация о модулях", "col1_btn_10"),
             (6, "Запустить прошивку", "col1_btn_6"),
             (8, "Просмотр результата", "col1_btn_8"),
@@ -2112,7 +2188,7 @@ class MainWindow(QMainWindow):
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
             "api_path": self.api_path_edit.text(),
-            "ignore_restrictions": self.ignore_restrict_cb.isChecked()
+            "format_control": self.format_control_cb.isChecked()
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
@@ -2124,7 +2200,7 @@ class MainWindow(QMainWindow):
         self.fw_edit.setText(self.config.get("firmware_dir", ""))
         self.plan_edit.setText(self.config.get("plan_xml", ""))
         self.api_path_edit.setText(self.config.get("api_path", "/vx3/backend.fcgi"))
-        self.ignore_restrict_cb.setChecked(bool(self.config.get("ignore_restrictions", False)))
+        self.format_control_cb.setChecked(bool(self.config.get("format_control", True)))
 
     def append_log(self, msg):
         color = "#000000"
@@ -2155,7 +2231,7 @@ class MainWindow(QMainWindow):
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
             "api_path": self.api_path_edit.text(),
-            "ignore_restrictions": self.ignore_restrict_cb.isChecked()
+            "format_control": self.format_control_cb.isChecked()
         }
 
     def check_remote_dir_exists(self, path):
@@ -2199,7 +2275,7 @@ class MainWindow(QMainWindow):
         elif op_id == 2:
             if not self.check_agent_exists():
                 QMessageBox.critical(self, "Ошибка",
-                                     "Агент IskraIO_Util отсутствует. Сначала выполните 'Загрузить агента'.")
+                                     "Агент IskraIO_Util отсутствует. Сначала выполните 'Внедрить агента и прошивки'.")
                 return
             reply = QMessageBox.warning(self, "Предупреждение",
                                         "Телемеханика будет остановлена. Продолжить?",
