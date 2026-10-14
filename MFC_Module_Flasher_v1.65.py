@@ -69,7 +69,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.64"
+APP_VERSION = "1.65"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -385,9 +385,17 @@ def normalize_img_type(value):
 
 
 def parse_plan_xml(xml_path):
-    """Разбор plan.xml: список модулей сценария прошивки по элементам <Image>."""
+    """Разбор plan.xml: список модулей сценария прошивки по элементам <Image>.
+
+    Корневой тег сценария — всегда <Root> (по требованию бэкенда).
+    Обратная совместимость с старым тегом <Plan> не поддерживается.
+    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    if root.tag != 'Root':
+        raise ValueError(
+            f"Неверный корневой тег plan.xml: '{root.tag}' (ожидался 'Root')"
+        )
     modules = []
     for img in root.iter('Image'):
         modules.append({
