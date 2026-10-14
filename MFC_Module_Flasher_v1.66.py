@@ -69,7 +69,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.65"
+APP_VERSION = "1.66"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -692,11 +692,15 @@ class OperationWorker(QThread):
         self.log_signal.emit(f"[{timestamp}] {msg}")
 
     def run(self):
+        ssh = None
         try:
             if self.op_id == 10:
                 self._op10_get_module_info()
                 return
-            if self.op_id == 11:
+            if self.op_id in (9, 11):
+                # v1.66: «Редактировать СП» не держит SSH-соединение во время
+                # открытия диалога — раньше это приводило к падению после
+                # надписи "Загрузка plan.xml с устройства...".
                 self._op11_prepare_edit_plan()
                 return
 
@@ -718,14 +722,20 @@ class OperationWorker(QThread):
                 self._op7_download_dump(ssh)
             elif self.op_id == 8:
                 self._op8_view_result(ssh)
-            elif self.op_id == 9:
-                self._op9_edit_plan(ssh)
 
-            ssh.close()
+            if ssh is not None:
+                ssh.close()
+                ssh = None
             self.finished_signal.emit(True, "Операция завершена успешно", {})
         except Exception as e:
             self.log(f"Критическая ошибка: {e!s}")
             self.finished_signal.emit(False, f"Ошибка: {e!s}", {})
+        finally:
+            if ssh is not None:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
 
     def _check_service_status(self, ssh, service_name):
         out, _ = ssh.exec_command(f"systemctl is-active {service_name}")
@@ -1185,19 +1195,26 @@ class OperationWorker(QThread):
         firmwares = self._scan_firmware_dir()
         ssh = SSHClient(self.config['ip'], self.config['password'])
         ssh.connect()
-        self.log("Загрузка plan.xml с устройства...")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-            tmp_path = tmp.name
+        tmp_path = None
         try:
+            self.log("Загрузка plan.xml с устройства...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                tmp_path = tmp.name
             ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_path)
+            self.log(f"Разбор plan.xml ({os.path.getsize(tmp_path)} байт)...")
             plan_modules = parse_plan_xml(tmp_path)
+            self.log(f"Строк сценария в plan.xml: {len(plan_modules)}")
         except Exception as e:
-            os.remove(tmp_path)
-            ssh.close()
             raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
         finally:
-            ssh.close()
-            if os.path.exists(tmp_path):
+            # v1.66: соединение и временный файл закрываются/удаляются ДО
+            # открытия диалога редактора — закрытие SSH после exec() диалога
+            # приводило к аварийному завершению приложения.
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            if tmp_path:
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -1294,13 +1311,18 @@ class OperationWorker(QThread):
             if err:
                 self.log(f"MakePlan stderr: {err}")
             self.log(f"MakePlan stdout: {out}")
-            self.progress_signal.emit(100)
             self.log("MakePlan завершён")
         except Exception as e:
             self.log(f"Ошибка во время MakePlan: {e}")
             raise
         finally:
             self._start_services(ssh)
+            # Требование v1.66: после контроля запуска сервисов подождать
+            # 10 секунд и сообщить о завершении операции создания СП.
+            self.log("Ожидание 10 сек после запуска сервисов...")
+            QThread.msleep(10000)
+            self.progress_signal.emit(100)
+            self.log("Операция создания СП завершена")
 
     def _op3_import_plan(self, ssh):
         self.log("Проверка наличия текущего plan.xml...")
@@ -1433,31 +1455,17 @@ class OperationWorker(QThread):
         self.finished_signal.emit(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result"})
 
     def _op9_edit_plan(self, ssh):
-        self.log("Получение актуальной информации о модулях...")
-        modules_info = self._fetch_module_info()
-        firmwares = self._scan_firmware_dir()
-        self.log("Загрузка plan.xml с устройства...")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-            tmp_path = tmp.name
+        # Требование v1.66: операция «Редактировать СП» выполняется через
+        # _op11_prepare_edit_plan (без SSH-потока в момент открытия диалога).
+        self._op11_prepare_edit_plan()
+
+    @staticmethod
+    def _safe_remove(path):
         try:
-            ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_path)
-            plan_modules = parse_plan_xml(tmp_path)
-        except Exception as e:
-            os.remove(tmp_path)
-            raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-        self.progress_signal.emit(100)
-        self.finished_signal.emit(True, "Редактирование СП", {
-            "modules_info": modules_info,
-            "plan_modules": plan_modules,
-            "firmwares": firmwares,
-            "action": "edit"
-        })
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 # ============================================================
@@ -2073,6 +2081,16 @@ class EditSPDialog(QDialog):
             QMessageBox.information(self, "Успех", "Сценарий успешно сохранён на устройстве")
             self.accept()
         except Exception as e:
+            # v1.66: cleanup-safe — временный файл удаляется в любом случае
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить сценарий: {e}")
 
 
@@ -2083,6 +2101,7 @@ class EditSPDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.worker = None  # v1.66: текущий воркер операции (защита от параллельного запуска)
         self.setWindowTitle(APP_TITLE)
         self.resize(1000, 800)
         self.config = self.load_config()
@@ -2197,6 +2216,13 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(bottom_layout)
 
         self.all_ops = [(op_id, text) for op_id, text, _ in col1_ops + col2_ops]
+        # v1.66: кнопки операций для блокировки на время выполнения
+        self.op_buttons = {}
+        for i, (op_id, _text, _obj_name) in enumerate(col1_ops):
+            self.op_buttons[op_id] = ops_layout.itemAtPosition(i, 0).widget()
+        for i, (op_id, _text, _obj_name) in enumerate(col2_ops):
+            self.op_buttons[op_id] = ops_layout.itemAtPosition(i, 1).widget()
+        self._ops_busy = False
 
     def browse_dir(self, line_edit):
         dir_path = QFileDialog.getExistingDirectory(self, "Выберите директорию")
@@ -2304,7 +2330,22 @@ class MainWindow(QMainWindow):
             self.append_log(f"Ошибка проверки агента: {e}")
             return False
 
+    def _set_ops_enabled(self, enabled):
+        """v1.66: блокировка кнопок операций на время выполнения другой операции."""
+        self._ops_busy = not enabled
+        for btn in self.op_buttons.values():
+            if btn is not None:
+                btn.setEnabled(enabled)
+
     def start_operation(self, op_id):
+        # v1.66: параллельный запуск операций запрещён
+        if getattr(self, "_ops_busy", False) or (
+                hasattr(self, "worker") and self.worker is not None
+                and self.worker.isRunning()):
+            QMessageBox.warning(self, "Внимание",
+                                "Уже выполняется другая операция. "
+                                "Дождитесь её завершения.")
+            return
         config = self.get_current_config()
         if not config['ip'] or not config['password']:
             QMessageBox.critical(self, "Ошибка", "Укажите IP-адрес и пароль!")
@@ -2349,9 +2390,19 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_operation_finished)
+        # v1.66: на время выполнения операции остальные кнопки блокируются
+        self._set_ops_enabled(False)
         self.worker.start()
 
     def on_operation_finished(self, success, message, data):
+        # v1.66: разблокировка кнопок выполняется в любом случае (finally),
+        # чтобы исключение при открытии диалога не «замораживало» интерфейс.
+        try:
+            self._handle_operation_result(success, message, data)
+        finally:
+            self._set_ops_enabled(True)
+
+    def _handle_operation_result(self, success, message, data):
         if not success:
             QMessageBox.critical(self, "Ошибка", message)
             return
