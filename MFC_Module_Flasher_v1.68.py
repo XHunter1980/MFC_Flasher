@@ -844,6 +844,19 @@ class OperationWorker(QThread):
             t = "POWER_UNIT"
         return t
 
+    @staticmethod
+    def _sn_of(mod):
+        """Серийный номер модуля из module_arr (поддержка синонимов).
+
+        Бэкенд в разных прошивках отдаёт поле как 'serial_num' либо
+        'serial_number'; пустое/нулевое значение не считается SN.
+        """
+        for key in ("serial_num", "serial_number"):
+            val = str((mod or {}).get(key) or "").strip()
+            if val and val.upper() not in ("NA", "N/A", "NONE", "0"):
+                return val
+        return ""
+
     def _fetch_module_info(self):
         """Запрос IskraIOGetAll и построение списка установленных модулей.
 
@@ -892,25 +905,9 @@ class OperationWorker(QThread):
                 _s = int(_mod.get("slot_num"))
             except (TypeError, ValueError):
                 continue
-        def _sn_of(mod):
-            """Серийный номер модуля из module_arr (поддержка синонимов).
-
-            Бэкенд в разных прошивках отдаёт поле как 'serial_num' либо
-            'serial_number'; пустое/нулевое значение не считается SN.
-            """
-            for key in ("serial_num", "serial_number"):
-                val = str((mod or {}).get(key) or "").strip()
-                if val and val.upper() not in ("NA", "N/A", "NONE", "0"):
-                    return val
-            return ""
-
             _prev = mod_by_slot.get(_s)
-            if _prev is None or (not _sn_of(_prev) and _sn_of(_mod)):
+            if _prev is None or (not self._sn_of(_prev) and self._sn_of(_mod)):
                 mod_by_slot[_s] = _mod
-
-        def _has_serial(mod):
-            """Есть ли у модуля серийный номер (критерий доступности прошивки)."""
-            return bool(_sn_of(mod))
 
         # --- module_info_arr: index -> тип слота --------------------------
         # Формат записи (реальное устройство):
@@ -1075,7 +1072,7 @@ class OperationWorker(QThread):
         #    не описала (тип NA) — потенциальное смещение. Резервные слоты
         #    широких модулей в проверку не входят (там тип известен).
         mismatch_serial_na = [slot for slot, mod in sorted(mod_by_slot.items())
-                              if _sn_of(mod)
+                              if self._sn_of(mod)
                               and slot not in reserved_slots
                               and self._canon_type(type_by_slot.get(slot, ""))
                               in ("", "NA")]
@@ -1113,7 +1110,7 @@ class OperationWorker(QThread):
             mod = mod_by_slot.get(slot, {})
             module_type = type_by_slot.get(slot, "NA")
             source = "module_arr" if slot in mod_by_slot else "module_info_arr"
-            serial_num = _sn_of(mod) or "N/A"
+            serial_num = self._sn_of(mod) or "N/A"
             reserved = slot in reserved_slots
             if reserved:
                 self.log(f"Слот {slot}: резерв '{module_type}' — прошивка запрещена")
