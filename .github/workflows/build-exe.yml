@@ -1,0 +1,109 @@
+name: Build Windows EXE
+
+# Сборка .exe через PyInstaller на windows-latest.
+# 1) Ручной запуск (Actions -> Build Windows EXE -> Run workflow): артефакт dist-экземпляр.
+# 2) Push тега vX.Y.Z: сборка + автоматический релиз GitHub с вложенным .exe.
+#
+# Права: contents:write нужен action-у для загрузки ассета в релиз;
+# generate_release_notes требует разрешений в Settings -> Actions -> General
+# ("Read and write permissions"), поэтому при их отсутствии используется
+# запасной способ создания релиза через REST API (token GITHUB_TOKEN).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Сборка MFC_Flasher.exe (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установка зависимостей и PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Определение версии приложения
+        id: ver
+        shell: bash
+        run: |
+          # Версия берётся из константы APP_VERSION в исходнике — она же
+          # попадает в название .exe (требование: версия в имени файла).
+          SRC=$(ls MFC_Module_Flasher_v*.py | sort -V | tail -1)
+          VER=$(python -c "import re,sys; m=re.search(r'APP_VERSION\s*=\s*[\"\x27]([\d.]+)[\"\x27]', open(sys.argv[1],encoding='utf-8').read()); print(m.group(1))" "$SRC")
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "exe=MFC_Flasher_v$VER.exe" >> "$GITHUB_OUTPUT"
+          echo "Собираем $SRC -> MFC_Flasher_v$VER.exe"
+
+      - name: Сборка exe (onefile, без консоли, версия в имени)
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name "MFC_Flasher_v${{ steps.ver.outputs.version }}" \
+            "${{ steps.ver.outputs.src }}"
+
+      - name: Проверка результата сборки
+        shell: bash
+        run: |
+          test -f "dist/${{ steps.ver.outputs.exe }}"
+          ls -la dist/
+
+      - name: Загрузка артефакта (для ручного запуска)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
+          path: dist/${{ steps.ver.outputs.exe }}
+          if-no-files-found: error
+
+      - name: Создание релиза с .exe (при пуше тега)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.ver.outputs.exe }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Запасной релиз через REST API (если action не смог)
+        if: failure() && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Создаём релиз (неfatal, если уже существует)
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md.\",\"draft\":false,\"prerelease\":false}" \
+            || echo "Релиз, возможно, уже существует"
+          RELEASE_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+            | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=MFC_Flasher_v${{ steps.ver.outputs.version }}.exe" \
+            --data-binary "@dist/MFC_Flasher_v${{ steps.ver.outputs.version }}.exe"
+          echo "Ассет MFC_Flasher_v${{ steps.ver.outputs.version }}.exe загружен в релиз $TAG"
