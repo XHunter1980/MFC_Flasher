@@ -19,13 +19,13 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Flasher_v1.68.py
+    python MFC_Module_Flasher_v1.69.py
 
 История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
 версию APP_VERSION и добавляйте запись в историю).
 
 Автор: Екимов Д.А. @ 2026
-Версия: 1.68
+Версия: 1.69
 """
 import glob
 import html
@@ -70,7 +70,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.68"
+APP_VERSION = "1.69"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -120,6 +120,8 @@ QPushButton#dialog_btn_cancel { background-color: #555555; color: white; padding
 QPushButton#dialog_btn_cancel:hover { background-color: #3a3a3a; }
 QPushButton#autofill_btn { background-color: #b8860b; color: white; padding: 6px 20px; }
 QPushButton#autofill_btn:hover { background-color: #8b6508; }
+QPushButton#type_select_btn { background-color: #4a6fa5; color: white; padding: 5px 14px; }
+QPushButton#type_select_btn:hover { background-color: #38567f; }
 QPushButton#browse_fw_btn { background-color: #2e7d32; color: white; padding: 2px 8px; font-size: 12px; }
 QPushButton#browse_fw_btn:hover { background-color: #1b5e20; }
 QGroupBox { border: 1px solid #b0b0b0; border-radius: 5px; margin-top: 10px; padding-top: 15px; font-weight: bold; color: #000000; }
@@ -1218,7 +1220,14 @@ class OperationWorker(QThread):
                 tmp_path = tmp.name
             ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_path)
             self.log(f"Разбор plan.xml ({os.path.getsize(tmp_path)} байт)...")
-            plan_modules = parse_plan_xml(tmp_path)
+            try:
+                plan_modules = parse_plan_xml(tmp_path)
+            except FileNotFoundError:
+                # v1.69: пустой СП (<Root/>) — парсер отдаёт ошибку; редактор
+                # открывается без строк сценария (все пути подхватятся
+                # автозаполнением).
+                self.log("План прошивки пуст — открываю редактор без строк СП")
+                plan_modules = []
             self.log(f"Строк сценария в plan.xml: {len(plan_modules)}")
             self._log_plan_skipped(tmp_path, plan_modules)
         except Exception as e:
@@ -1353,10 +1362,10 @@ class OperationWorker(QThread):
             raise
         finally:
             self._start_services(ssh)
-            # Требование v1.66: после контроля запуска сервисов подождать
-            # 10 секунд и сообщить о завершении операции создания СП.
-            self.log("Ожидание 10 сек после запуска сервисов...")
-            QThread.msleep(10000)
+            # Требование v1.69: после контроля запуска сервисов подождать
+            # 15 секунд и сообщить о завершении операции создания СП.
+            self.log("Ожидание 15 сек после запуска сервисов...")
+            QThread.msleep(15000)
             self.progress_signal.emit(100)
             self.log("Операция создания СП завершена")
 
@@ -1392,6 +1401,23 @@ class OperationWorker(QThread):
             raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Внедрить агента и прошивки'.")
         self.log(f"Найдено файлов прошивок на устройстве: {len(remote_images)}")
 
+        # v1.69: контроль типа образов в СП — при включённом контроле
+        # формата запрещена прошивка full-файлами (агенты с планом, где
+        # type="full", на Update не запускаются).
+        if bool(self.config.get('format_control', True)):
+            plan_modules = parse_plan_xml(self.config['plan_xml']) \
+                if os.path.isfile(self.config.get('plan_xml', '')) else []
+            bad_types = [m for m in plan_modules
+                         if normalize_img_type(m.get('img_type')) not in
+                         ('apply', 'boot')]
+            if bad_types:
+                raise Exception(
+                    "В сценарии прошивки есть недопустимые типы образов "
+                    "(прошивается только appl/boot): " +
+                    ", ".join(f"слот {m['slot']} ({m.get('img_type')})"
+                              for m in bad_types) +
+                    ". Отредактируйте СП или отключите «Контроль формата "
+                    "прошивок».")
         try:
             self._stop_services(ssh)
             self.log("Запуск прошивки (Update)...")
@@ -1755,10 +1781,23 @@ class EditSPDialog(QDialog):
         layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
-        self.autofill_btn = QPushButton("Автозаполнение")
-        self.autofill_btn.setObjectName("autofill_btn")
-        self.autofill_btn.clicked.connect(self.autofill)
-        btn_layout.addWidget(self.autofill_btn)
+        # v1.69: одна «Автозаполнение» разделена на две — по типу прошивки
+        # (appl / boot). Формат full автозаполнением не выбирается.
+        self.autofill_appl_btn = QPushButton("Автозаполнение appl")
+        self.autofill_appl_btn.setObjectName("autofill_btn")
+        self.autofill_appl_btn.setToolTip(
+            "Подобрать файлы типа appl по типам модулей и выставить тип 'appl'")
+        self.autofill_appl_btn.clicked.connect(
+            lambda: self.autofill("apply"))
+        btn_layout.addWidget(self.autofill_appl_btn)
+
+        self.autofill_boot_btn = QPushButton("Автозаполнение boot")
+        self.autofill_boot_btn.setObjectName("autofill_btn")
+        self.autofill_boot_btn.setToolTip(
+            "Подобрать файлы типа boot по типам модулей и выставить тип 'boot'")
+        self.autofill_boot_btn.clicked.connect(
+            lambda: self.autofill("boot"))
+        btn_layout.addWidget(self.autofill_boot_btn)
 
         self.select_all_btn = QPushButton("Выбрать все")
         self.select_all_btn.setObjectName("dialog_btn_ok")
@@ -1770,19 +1809,16 @@ class EditSPDialog(QDialog):
         self.deselect_all_btn.clicked.connect(self.deselect_all)
         btn_layout.addWidget(self.deselect_all_btn)
 
-        # Массовая установка типа прошивки по всем строкам (для full-прошивок;
-        # для appl-/boot-директорий combo остаётся в допустимом состоянии)
-        self.set_apply_btn = QPushButton("appl")
-        self.set_apply_btn.setObjectName("dialog_btn_cancel")
-        self.set_apply_btn.setToolTip("Выставить тип прошивки 'appl' во всех строках")
-        self.set_apply_btn.clicked.connect(lambda: self.set_all_img_types("apply"))
-        btn_layout.addWidget(self.set_apply_btn)
-
-        self.set_boot_btn = QPushButton("boot")
-        self.set_boot_btn.setObjectName("dialog_btn_cancel")
-        self.set_boot_btn.setToolTip("Выставить тип прошивки 'boot' во всех строках")
-        self.set_boot_btn.clicked.connect(lambda: self.set_all_img_types("boot"))
-        btn_layout.addWidget(self.set_boot_btn)
+        # v1.69: кнопки массового выбора типов модулей, присутствующих в
+        # устройстве (создаются динамически в _build_type_select_buttons)
+        self.type_group = QGroupBox("Выбор модулей по типу")
+        self.type_group.setObjectName("type_select_group")
+        self.type_group_layout = QHBoxLayout(self.type_group)
+        self.type_group_layout.setContentsMargins(6, 4, 6, 4)
+        self.type_group_layout.setSpacing(6)
+        self._type_btns = []
+        self._build_type_select_buttons()
+        layout.addWidget(self.type_group)
 
         btn_layout.addStretch()
 
@@ -1959,7 +1995,40 @@ class EditSPDialog(QDialog):
                 else:
                     w.setStyleSheet("")
 
-    def autofill(self):
+    def _fw_matches_type(self, fw, want_type):
+        """Относит ли файл прошивки к запрошенному типу образа (appl/boot).
+
+        Приоритет: директория-источник ('source' из скана firmware_dir),
+        затем префикс имени файла ('name_prefix'), затем 'fw_type'.
+        Файлы формата full (префикс/источник 'full') не относятся ни к
+        appl, ни к boot — автозаполнение их не выбирает.
+        """
+        src = (fw.get('source') or '').lower()
+        if src in ('apply', 'appl'):
+            return want_type == 'apply'
+        if src == 'boot':
+            return want_type == 'boot'
+        if src == 'full':
+            return False
+        prefix = (fw.get('name_prefix') or '').lower()
+        if prefix == 'appl':
+            return want_type == 'apply'
+        if prefix == 'boot':
+            return want_type == 'boot'
+        if prefix == 'full':
+            return False
+        # fallback: внутренний тип образа из разбора имени
+        return (fw.get('fw_type') or '') == want_type
+
+    def autofill(self, want_type="apply"):
+        """Автозаполнение путей и типа прошивки по всем прошиваемым строкам.
+
+        want_type: 'apply' (кнопка «Автозаполнение appl») или 'boot'.
+        Подбираются только файлы соответствующего типа; формат full не
+        выбирается. Тип образа в combo выставляется в want_type (для
+        appl-/boot-директорий он и так единственный допустимый). После
+        заполнения — «Снять все», затем «Выбрать все».
+        """
         filled = 0
         for i, row in enumerate(self.rows):
             # Резервы широких модулей и недоступные для прошивки слоты
@@ -1969,7 +2038,8 @@ class EditSPDialog(QDialog):
             mt = row['module_type'].upper()
             if mt in ("NA", ""):
                 continue
-            candidates = self.fw_by_type.get(mt, [])
+            candidates = [fw for fw in self.fw_by_type.get(mt, [])
+                          if self._fw_matches_type(fw, want_type)]
             if not candidates:
                 continue
 
@@ -1986,6 +2056,13 @@ class EditSPDialog(QDialog):
             row['path'] = rel_path
             row['local_fw'] = best
             row['source'] = best.get('source') or detect_fw_source(rel_path)
+            # Выставляем запрошенный тип образа (combo сам ограничит выбор
+            # допустимым для источника значением)
+            combo = self.type_combos[i]
+            idx_t = combo.findData(want_type)
+            if idx_t >= 0:
+                combo.setCurrentIndex(idx_t)
+            row['img_type'] = want_type
             self._update_row(i)
             filled += 1
         # После автозаполнения: сначала снять весь выбор, затем выбрать все
@@ -1993,7 +2070,10 @@ class EditSPDialog(QDialog):
         self.deselect_all()
         self.select_all()
         if not os.environ.get("MFC_TESTS_NO_MSGBOX"):
-            QMessageBox.information(self, "Автозаполнение", f"Заполнено путей: {filled}")
+            QMessageBox.information(
+                self, "Автозаполнение",
+                f"Тип прошивки: {display_img_type(want_type)}. "
+                f"Заполнено путей: {filled}")
 
     def _is_selectable(self, idx):
         """Строка подлежит выбору: модуль прошивается, путь к файлу указан и
@@ -2050,21 +2130,78 @@ class EditSPDialog(QDialog):
             cb.setChecked(False)
             self._update_row(i)
 
-    def set_all_img_types(self, img_type):
-        """Кнопки 'appl'/'boot': выставляют тип прошивки во всех строках.
+    def _present_module_types(self):
+        """Типы модулей, реально присутствующие в устройстве (в порядке слотов).
 
-        Для строк с путём из директории appl/ или boot/ значение остаётся
-        допустимым (только своим) — _apply_combo_for_source сам вернёт
-        разрешённый тип; для full-строк устанавливается выбранный тип.
+        Берутся только прошиваемые строки (есть SN, не резерв) с известным
+        типом; NA/пустые типы исключаются. PSU нормализуется к POWER_UNIT.
         """
-        for i in range(len(self.rows)):
-            combo = self.type_combos[i]
-            if combo.isEnabled():
-                idx = combo.findData(img_type)
-                it = combo.model().item(idx) if hasattr(combo.model(), "item") else None
-                if idx >= 0 and it is not None and it.flags() & Qt.ItemFlag.ItemIsEnabled:
-                    combo.setCurrentIndex(idx)
+        seen = []
+        for row in self.rows:
+            if not row.get("flashable", True):
+                continue
+            mt = str(row.get("module_type") or "").strip().upper()
+            if mt in ("", "NA"):
+                continue
+            if mt == "PSU":
+                mt = "POWER_UNIT"
+            if mt not in seen:
+                seen.append(mt)
+        return seen
+
+    def _build_type_select_buttons(self):
+        """Кнопки выбора всех модулей конкретного типа (v1.69).
+
+        Создаются по типам модулей, присутствующим в устройстве. Нажатие
+        включает выбор во всех подходящих строках данного типа (условия
+        selectable соблюдаются); строки других типов не меняются.
+        """
+        for b in self._type_btns:
+            b.setParent(None)
+            b.deleteLater()
+        self._type_btns = []
+        types = self._present_module_types()
+        if not types:
+            self.type_group.setVisible(False)
+            return
+        self.type_group.setVisible(True)
+        self.type_group.setTitle(
+            "Выбор модулей по типу (присутствуют в устройстве)")
+        for mt in types:
+            btn = QPushButton(mt)
+            btn.setObjectName("type_select_btn")
+            btn.setToolTip(f"Выбрать все модули типа {mt}")
+            btn.clicked.connect(lambda checked, t=mt: self.select_by_type(t))
+            self.type_group_layout.addWidget(btn)
+            self._type_btns.append(btn)
+
+    def select_by_type(self, module_type):
+        """Включает выбор во всех строках указанного типа модуля."""
+        want = (module_type or "").upper()
+        changed = 0
+        for i, cb in enumerate(self.checkboxes):
+            row = self.rows[i]
+            rt = str(row.get("module_type") or "").strip().upper()
+            if rt == "PSU":
+                rt = "POWER_UNIT"
+            if rt != want:
+                continue
+            if not self._is_selectable(i):
+                # путь пуст / формат не прошёл контроль — выбрать нельзя
+                continue
+            if not cb.isChecked():
+                cb.setChecked(True)
+                changed += 1
             self._update_row(i)
+        if changed == 0 and not any(
+                self._is_selectable(i) and
+                (str(self.rows[i].get("module_type") or "").strip().upper()
+                 in (want, "PSU" if want == "POWER_UNIT" else want))
+                for i in range(len(self.rows))):
+            QMessageBox.information(
+                self, "Выбор по типу",
+                f"Нет доступных для прошивки модулей типа {want} "
+                "(не заполнены пути или не пройден контроль формата)")
 
     def _validate_row(self, idx):
         row = self.rows[idx]
@@ -2124,8 +2261,16 @@ class EditSPDialog(QDialog):
             selected.append(row)
 
         if not selected:
-            QMessageBox.warning(self, "Внимание", "Не выбрано ни одного модуля для прошивки")
-            return
+            # v1.69: пустой сценарий сохраняется по требованию заказчика —
+            # предупреждение показывается, но запись plan.xml выполняется
+            # (создаётся пустой <Root/>).
+            ret = QMessageBox.warning(
+                self, "Внимание",
+                "Не выбрано ни одного модуля для прошивки.\n"
+                "Сохранить пустой сценарий прошивки?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                return
 
         # Корень сценария прошивки — <Root> (по требованию бэкенда; раньше был <Plan>)
         # Тип образа 'apply' записывается в файл как 'appl' (требование бэкенда).
