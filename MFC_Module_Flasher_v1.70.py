@@ -6,7 +6,8 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     контроллера (МФК) через SSH/SFTP-агента IskraIO_Util и HTTP-бэкенд устройства.
 
 Возможности:
-    - Внедрение агента и файлов прошивок на устройство с контролем формата (операция 1);
+    - Внедрение агента и файлов прошивок на устройство с контролем формата
+      и двумя режимами лога — кратким/подробным (операция 1);
     - Создание сценария прошивки MakePlan (операция 2);
     - Импорт/экспорт сценария plan.xml (операции 3, 4);
     - Запуск прошивки Update с анализом result.txt (операция 6);
@@ -70,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.69"
+APP_VERSION = "1.70"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -82,6 +83,7 @@ DEFAULT_CONFIG = {
     "plan_xml": "",
     "api_path": "/vx3/backend.fcgi",
     "format_control": True,
+    "verbose_log": False,
 }
 
 STYLESHEET = """
@@ -692,12 +694,47 @@ class OperationWorker(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(bool, str, dict)
 
+    # Сообщения операционного лога, подавляемые в кратком режиме
+    # (детализация дублируется сводными строками; включается опцией
+    # «Подробный операционный лог», по умолчанию выключена).
+    _VERBOSE_ONLY_MARKERS = (
+        "Соответствие слот/тип:",
+        "Проверка: тип ",
+        "Внимание: отвечающих модулей",
+        "Слот ",  # + ': тип модуля не определён' / ': резерв' — ниже точнее
+        "Запись index=",
+        "Хвостовых артефактных записей",
+        "Сопоставление слот/тип:",
+        "Строк сценария в plan.xml:",
+        "Разбор plan.xml (",
+        "Некорректные имена (без префикса",
+        "Файлы формата full:",
+    )
+
     def __init__(self, op_id, config):
         super().__init__()
         self.op_id = op_id
         self.config = config
+        # v1.70: два режима операционного лога — краткий (по умолчанию) и
+        # подробный (с детализацией). Флаг читается из конфига.
+        self.verbose_log = bool(config.get('verbose_log', False))
+
+    def _is_verbose_only(self, msg):
+        """Относит ли сообщение к детализации, скрытой в кратком режиме."""
+        if any(msg.startswith(m) or m in msg for m in self._VERBOSE_ONLY_MARKERS
+               if m != "Слот "):
+            return True
+        # Пер-слотовые отладочные строки парсера (их много при 21+ слотах)
+        if msg.startswith("Слот ") and (": тип модуля не определён" in msg
+                                        or ": резерв" in msg):
+            return True
+        return False
 
     def log(self, msg):
+        # Краткий режим: пропускаем только детализирующие сообщения;
+        # ошибки, предупреждения ВНИМАНИЕ и итоги всегда видны.
+        if not self.verbose_log and self._is_verbose_only(msg):
+            return
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_signal.emit(f"[{timestamp}] {msg}")
 
@@ -1294,6 +1331,9 @@ class OperationWorker(QThread):
         # по умолчанию включена): не прошедшие контроль файлы на устройство
         # не загружаются; при отключённой — только предупреждения, загрузка
         # выполняется (включая формат full).
+        # v1.70: создание СП с некорректными именами и/или форматом full
+        # возможно только при ОТКЛЮЧЁННОМ контроле формата — при включённом
+        # full-файлы на устройство не загружаются и в сценарий не попадут.
         fc_on = bool(self.config.get('format_control', True))
         all_count = len(firmwares)
         bad_names = []
@@ -1301,8 +1341,6 @@ class OperationWorker(QThread):
         kept = []
         for fw in firmwares:
             fmt, ok, supported, warning = fw_name_format(fw['filename'])
-            if warning:
-                self.log(f"Предупреждение: {warning}")
             if not ok:
                 bad_names.append(fw['filename'])
             elif fmt == 'full':
@@ -1312,23 +1350,36 @@ class OperationWorker(QThread):
             kept.append(fw)
         skipped = len(firmwares) - len(kept)
         if bad_names or full_names:
-            msg_lines = []
+            # v1.70: без дублей — предупреждение выводится одной сводной
+            # строкой (списки имён — только в подробном режиме лога).
+            parts = []
             if bad_names:
-                msg_lines.append(
-                    "Некорректные имена (без префикса appl/boot/full):\n  "
-                    + "\n  ".join(bad_names))
+                parts.append(f"некорректных имён: {len(bad_names)}")
             if full_names:
-                msg_lines.append(
-                    "Формат full пока НЕ поддерживается:\n  "
-                    + "\n  ".join(full_names))
+                parts.append(f"формат full (не поддерживается): "
+                             f"{len(full_names)}")
+            detail = "; ".join(parts)
             if fc_on:
-                msg_lines.append(
-                    f"\nКонтроль формата включен: эти файлы НЕ будут "
-                    f"загружены на устройство (пропущено: {skipped}).")
+                self.log(f"ВНИМАНИЕ: файлов с проблемами формата — {detail}. "
+                         f"Контроль формата ВКЛЮЧЕН: они НЕ загружаются на "
+                         f"устройство (пропущено: {skipped}), создание СП "
+                         f"такими прошивками невозможно.")
             else:
-                msg_lines.append("\nЗагрузка на устройство будет выполнена.")
-            self.log("ВНИМАНИЕ: " + " | ".join(
-                m.replace("\n", " ") for m in msg_lines))
+                self.log(f"ВНИМАНИЕ: файлов с проблемами формата — {detail}. "
+                         f"Контроль формата ОТКЛЮЧЕН: загрузка на устройство "
+                         f"будет выполнена; создание СП с такими файлами "
+                         f"допускается (с предупреждением).")
+            if self.verbose_log:
+                if bad_names:
+                    self.log("Некорректные имена (без префикса appl/boot/"
+                             "full): " + ", ".join(bad_names))
+                if full_names:
+                    self.log("Файлы формата full: " + ", ".join(full_names))
+        elif self.verbose_log:
+            for fw in firmwares:
+                _f, _o, _s, warning = fw_name_format(fw['filename'])
+                if warning:
+                    self.log(f"Предупреждение: {warning}")
         firmwares = kept
         total = len(firmwares)
         if total == 0:
@@ -1440,11 +1491,22 @@ class OperationWorker(QThread):
             stdin, stdout, stderr = ssh.client.exec_command("cat /home/user/fw_update/result.txt")
             result_content = stdout.read().decode()
             results = parse_result_txt(result_content)
-            for slot, status in results.items():
-                if "Complete" in status:
-                    self.log(f"Слот {slot}: Успешно")
-                else:
-                    self.log(f"Слот {slot}: Ошибка - {status}")
+            ok_slots = [s for s, st in results.items() if "Complete" in st]
+            err_slots = {s: st for s, st in results.items()
+                         if "Complete" not in st}
+            # v1.70: пер-слотовые строки — только в подробном режиме;
+            # в кратком остаётся сводка ниже (и ошибки operation.log).
+            if self.verbose_log:
+                for slot, status in sorted(results.items(), key=lambda x: int(x[0])):
+                    if "Complete" in status:
+                        self.log(f"Слот {slot}: Успешно")
+                    else:
+                        self.log(f"Слот {slot}: Ошибка - {status}")
+            summary = f"Итог result.txt: успешно {len(ok_slots)}"
+            if err_slots:
+                summary += (", с ошибками " + str(len(err_slots)) + " (слоты: "
+                            + ", ".join(sorted(err_slots, key=int)) + ")")
+            self.log(summary)
             # Анализ operation.log: различаем 'нет информации' и 'ошибка'
             try:
                 op_analysis = analyze_operation_log(local_log)
@@ -1649,6 +1711,9 @@ class EditSPDialog(QDialog):
         self.setWindowTitle("Редактирование сценария прошивки")
         self.resize(1600, 820)
         self.config = config
+        # v1.70: предупреждения при сохранении СП без контроля формата
+        # (некорректные имена / формат full) — выводятся одним окном.
+        self.warnings = []
         self.firmwares = firmwares
         self.fw_by_type = {}
         for fw in firmwares:
@@ -1942,15 +2007,22 @@ class EditSPDialog(QDialog):
         row = self.rows[idx]
         fw = row.get('local_fw')
 
-        # Пустой путь к файлу — выбор модуля автоматически снимается
-        # (требование заказчика; раньше правило действовало только при
-        # редактировании пути и «Выбрать все»).
+        # v1.70: пустой путь к файлу — выбор модуля снят И чекбокс
+        # неактивен (нельзя выбрать модуль без файла прошивки).
         cb = self.checkboxes[idx]
-        if cb.isEnabled() and not self.path_edits[idx].text().strip():
-            if cb.isChecked():
+        path_empty = not self.path_edits[idx].text().strip()
+        if row.get("flashable", True):
+            wants_checked = (not path_empty) and bool(fw) and self._format_ok(
+                self.path_edits[idx].text().strip())
+            cb.setEnabled(not path_empty)
+            if cb.isChecked() != wants_checked:
                 cb.blockSignals(True)
-                cb.setChecked(False)
+                cb.setChecked(wants_checked)
                 cb.blockSignals(False)
+            if path_empty:
+                cb.setToolTip("Путь к файлу прошивки не указан — выбор недоступен")
+            else:
+                cb.setToolTip("")
 
         if fw:
             self.table.item(idx, self.COL_FW_VER).setText(fw.get('version', 'N/A'))
@@ -2221,10 +2293,13 @@ class EditSPDialog(QDialog):
                            f"{warning or 'файл не прошёл контроль формата'}")
         parsed = parse_firmware_filename(filename)
         if parsed is None and not bool(self.config.get('format_control', True)):
-            # без контроля формата достаточно корректного префикса имени
-            _fmt, ok_prefix, _sup, warning = fw_name_format(filename)
-            if not ok_prefix:
-                return False, (f"Слот {row['slot']}: {warning}")
+            # v1.70: без контроля формата создание СП допускается с
+            # НЕКОРРЕКТНЫМИ именами и форматом full — только предупреждение
+            # (пользователь осознанно отключил контроль).
+            _fmt, _okp, _sup, warning = fw_name_format(filename)
+            if warning:
+                self.warnings.append(f"Слот {row['slot']}: {warning}")
+            return True, ""
         if parsed is None:
             return False, f"Слот {row['slot']}: файл '{filename}' не соответствует формату имени прошивки"
         if parsed['module_type'] != row['module_type'].upper():
@@ -2259,6 +2334,20 @@ class EditSPDialog(QDialog):
                 QMessageBox.critical(self, "Ошибка валидации", err)
                 return
             selected.append(row)
+
+        # v1.70: накопленные предупреждения (СП с некорректными именами /
+        # форматом full при отключённом контроле) — показываем одним окном,
+        # сохранение при этом возможно.
+        if self.warnings:
+            ret = QMessageBox.warning(
+                self, "Предупреждения формата прошивок",
+                "Контроль формата отключен, в сценарий попадают файлы:\n"
+                + "\n".join(self.warnings[:20])
+                + ("\n..." if len(self.warnings) > 20 else "")
+                + "\n\nСохранить сценарий?")
+            self.warnings = []
+            if ret != QMessageBox.StandardButton.Yes:
+                return
 
         if not selected:
             # v1.69: пустой сценарий сохраняется по требованию заказчика —
@@ -2379,6 +2468,16 @@ class MainWindow(QMainWindow):
             "При отключении ограничения снимаются: выводятся только\n"
             "предупреждения, загрузка и прошивка выполняются.")
         conn_layout.addWidget(self.format_control_cb, 5, 0, 1, 4)
+        # v1.70: режим операционного лога. По умолчанию — краткий (без
+        # детализации: сводные итоги вместо пер-слотовых отладочных строк).
+        self.verbose_log_cb = QCheckBox(
+            "Подробный операционный лог (с детализацией)")
+        self.verbose_log_cb.setToolTip(
+            "По умолчанию выключена: в журнале только ключевые события,\n"
+            "итоговые сводки, предупреждения и ошибки.\n"
+            "Включите для отладки: добавятся пер-слотовые строки парсера,\n"
+            "списки файлов с проблемами формата и прочая детализация.")
+        conn_layout.addWidget(self.verbose_log_cb, 6, 0, 1, 4)
         conn_group.setLayout(conn_layout)
         main_layout.addWidget(conn_group)
 
@@ -2478,7 +2577,8 @@ class MainWindow(QMainWindow):
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
             "api_path": self.api_path_edit.text(),
-            "format_control": self.format_control_cb.isChecked()
+            "format_control": self.format_control_cb.isChecked(),
+            "verbose_log": self.verbose_log_cb.isChecked()
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
@@ -2491,6 +2591,7 @@ class MainWindow(QMainWindow):
         self.plan_edit.setText(self.config.get("plan_xml", ""))
         self.api_path_edit.setText(self.config.get("api_path", "/vx3/backend.fcgi"))
         self.format_control_cb.setChecked(bool(self.config.get("format_control", True)))
+        self.verbose_log_cb.setChecked(bool(self.config.get("verbose_log", False)))
 
     def append_log(self, msg):
         color = "#000000"
@@ -2521,7 +2622,8 @@ class MainWindow(QMainWindow):
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
             "api_path": self.api_path_edit.text(),
-            "format_control": self.format_control_cb.isChecked()
+            "format_control": self.format_control_cb.isChecked(),
+            "verbose_log": self.verbose_log_cb.isChecked()
         }
 
     def check_remote_dir_exists(self, path):
