@@ -89,6 +89,9 @@ logs = []
 w = mod.OperationWorker.__new__(mod.OperationWorker)
 w.config = {"ip": "1.2.3.4", "api_path": "/x"}
 w.log = lambda msg: logs.append(msg)
+# v1.71: worker читает режим детализации лога из конфига (в __init__);
+# при __new__ задаём вручную, тест — в подробном режиме (полные логи).
+w.verbose_log = True
 
 # перехват HTTP
 orig_req = mod.BackendClient.request
