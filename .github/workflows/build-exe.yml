@@ -90,15 +90,30 @@ jobs:
           API="https://api.github.com/repos/$REPO/releases"
           UP="https://uploads.github.com/repos/$REPO/releases"
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          jsonget() { curl -s "${AUTH[@]}" "$1" | python -c "import json,sys; d=json.load(sys.stdin); print(d.get('$2',''))" 2>/dev/null || true; }
+          # Надёжное получение id релиза по тегу: парсим tag_name+url (поле 'id' может
+          # отсутствовать в кэшированном/неполном ответе API — тогда берём id из url).
+          get_rel_id() {
+            curl -s "${AUTH[@]}" "$API/tags/$TAG" \
+              | python -c "
+          import json,sys,re
+          try: d=json.load(sys.stdin)
+          except Exception: sys.exit(0)
+          if d.get('tag_name') != '$TAG': sys.exit(0)
+          rid=d.get('id')
+          if not rid:
+              m=re.search(r'/releases/(\\d+)', d.get('url','') or '')
+              rid=m.group(1) if m else ''
+          print(rid)
+          " 2>/dev/null || true
+          }
           # 1) Ищем существующий релиз по тегу; если нет — создаём и ждём видимости
-          RELEASE_ID=$(jsonget "$API/tags/$TAG" id)
+          RELEASE_ID=$(get_rel_id)
           if [ -z "$RELEASE_ID" ]; then
             curl -s -o /tmp/rel.json -w "" -X POST "${AUTH[@]}" "$API" \
               -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}" || true
             for i in 1 2 3 4 5 6 7 8 9 10; do
               sleep 3
-              RELEASE_ID=$(jsonget "$API/tags/$TAG" id)
+              RELEASE_ID=$(get_rel_id)
               [ -n "$RELEASE_ID" ] && break
               echo "Ожидаем видимости созданного релиза $TAG (попытка $i)"
             done
@@ -148,23 +163,36 @@ jobs:
           set -uo pipefail
           API="https://api.github.com/repos/$REPO/releases"
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          jsonget() { curl -s "${AUTH[@]}" "$1" | python -c "import json,sys; d=json.load(sys.stdin); print(d.get('$2',''))" 2>/dev/null || true; }
+          get_rel_id() {
+            curl -s "${AUTH[@]}" "$API/tags/$TAG" \
+              | python -c "
+          import json,sys,re
+          try: d=json.load(sys.stdin)
+          except Exception: sys.exit(0)
+          if d.get('tag_name') != '$TAG': sys.exit(0)
+          rid=d.get('id')
+          if not rid:
+              m=re.search(r'/releases/(\\d+)', d.get('url','') or '')
+              rid=m.group(1) if m else ''
+          print(rid)
+          " 2>/dev/null || true
+          }
           EXE="MFC_Flasher_v${{ steps.ver.outputs.version }}.exe"
-          RELEASE_ID=$(jsonget "$API/tags/$TAG" id)
+          RELEASE_ID=$(get_rel_id)
           if [ -z "$RELEASE_ID" ]; then
             curl -s -X POST "${AUTH[@]}" "$API" \
               -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"Сборка exe от GitHub Actions (резервный путь).\",\"draft\":false,\"prerelease\":false}" >/dev/null || true
             for i in 1 2 3 4 5 6 7 8 9 10; do
               sleep 3
-              RELEASE_ID=$(jsonget "$API/tags/$TAG" id)
+              RELEASE_ID=$(get_rel_id)
               [ -n "$RELEASE_ID" ] && break
             done
           fi
           if [ -z "$RELEASE_ID" ]; then echo "::error::Нет релиза для $TAG"; exit 1; fi
           ASSET_ID=$(curl -s "${AUTH[@]}" "$API/$RELEASE_ID/assets" | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
-          if [ -n "$ASSET_ID" ]; then curl -s -X DELETE "${AUTH[@]}" "$API/../assets/$ASSET_ID" >/dev/null || true; fi
+          if [ -n "$ASSET_ID" ]; then curl -s -X DELETE "${AUTH[@]}" "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" >/dev/null || true; fi
           SIZE=$(wc -c < "dist/$EXE")
-          HTTP=$(curl -s -o /tmp/asset2.json -w "%{http_code}" -X POST \
+          HTTP=$(curl -s -o ./asset_upload.json -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             -H "Content-Length: $SIZE" \
@@ -172,7 +200,7 @@ jobs:
             "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$EXE")
           echo "Загрузка ассета: HTTP $HTTP"
           if [ "$HTTP" != "201" ]; then exit 1; fi
-          URL=$(python -c "import json; print(json.load(open('/tmp/asset2.json'))['browser_download_url'])")
+          URL=$(python -c "import json; print(json.load(open('./asset_upload.json'))['browser_download_url'])")
           CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
           echo "Проверка доступности: HTTP $CODE для $URL"
           [ "$CODE" = "206" ] || [ "$CODE" = "200" ] || exit 1
