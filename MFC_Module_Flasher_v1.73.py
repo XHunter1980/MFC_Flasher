@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.72"
+APP_VERSION = "1.73"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -819,13 +819,16 @@ class OperationWorker(QThread):
         "Файлы формата full:",
     )
 
-    def __init__(self, op_id, config):
+    def __init__(self, op_id, config, quiet=False):
         super().__init__()
         self.op_id = op_id
         self.config = config
         # v1.70: два режима операционного лога — краткий (по умолчанию) и
         # подробный (с детализацией). Флаг читается из конфига.
         self.verbose_log = bool(config.get('verbose_log', False))
+        # v1.73: «тихий» режим для Автопрошивки — подавляет диалоговые окна
+        # (автозаполнение, предупреждения формата) в EditSPDialog.
+        self.quiet = quiet
 
     def _is_verbose_only(self, msg):
         """Относит ли сообщение к детализации, скрытой в кратком режиме."""
@@ -858,6 +861,10 @@ class OperationWorker(QThread):
                 # надписи "Загрузка plan.xml с устройства...".
                 self._op11_prepare_edit_plan()
                 return
+            if self.op_id == 13 and not self.config.get('_auto_update'):
+                # v1.73: шаг тихого сохранения СП (без SSH-потока)
+                self._op13_quiet_save()
+                return
 
             ssh = SSHClient(self.config['ip'], self.config['password'])
             ssh.connect()
@@ -877,6 +884,14 @@ class OperationWorker(QThread):
                 self._op7_download_dump(ssh)
             elif self.op_id == 8:
                 self._op8_view_result(ssh)
+            elif self.op_id == 12:
+                # v1.73: удаление директории агента и прошивок с контроллера
+                ssh.close()
+                ssh = None
+                self._cleanup_remote_agent()
+            elif self.op_id == 13:
+                # v1.73: цепочка Автопрошивки — шаг сохранения СП + Update
+                self._op13_auto_flash_tail(ssh)
 
             if ssh is not None:
                 ssh.close()
@@ -1405,40 +1420,48 @@ class OperationWorker(QThread):
     def _op11_prepare_edit_plan(self):
         modules_info = self._fetch_module_info()
         firmwares = self._scan_firmware_dir()
-        ssh = SSHClient(self.config['ip'], self.config['password'])
-        ssh.connect()
-        tmp_path = None
-        try:
-            self.log("Загрузка plan.xml с устройства...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-                tmp_path = tmp.name
-            ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_path)
-            self.log(f"Разбор plan.xml ({os.path.getsize(tmp_path)} байт)...")
+        plan_modules = []
+        if not self.quiet:
+            ssh = SSHClient(self.config['ip'], self.config['password'])
+            ssh.connect()
+            tmp_path = None
             try:
-                plan_modules = parse_plan_xml(tmp_path)
-            except FileNotFoundError:
-                # v1.69: пустой СП (<Root/>) — парсер отдаёт ошибку; редактор
-                # открывается без строк сценария (все пути подхватятся
-                # автозаполнением).
-                self.log("План прошивки пуст — открываю редактор без строк СП")
-                plan_modules = []
-            self.log(f"Строк сценария в plan.xml: {len(plan_modules)}")
-            self._log_plan_skipped(tmp_path, plan_modules)
-        except Exception as e:
-            raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
-        finally:
-            # v1.66: соединение и временный файл закрываются/удаляются ДО
-            # открытия диалога редактора — закрытие SSH после exec() диалога
-            # приводило к аварийному завершению приложения.
-            try:
-                ssh.close()
-            except Exception:
-                pass
-            if tmp_path:
+                self.log("Загрузка plan.xml с устройства...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                    tmp_path = tmp.name
+                ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_path)
+                self.log(f"Разбор plan.xml ({os.path.getsize(tmp_path)} байт)...")
                 try:
-                    os.remove(tmp_path)
-                except OSError:
+                    plan_modules = parse_plan_xml(tmp_path)
+                except FileNotFoundError:
+                    # v1.69: пустой СП (<Root/>) — парсер отдаёт ошибку; редактор
+                    # открывается без строк сценария (все пути подхватятся
+                    # автозаполнением).
+                    self.log("План прошивки пуст — открываю редактор без строк СП")
+                    plan_modules = []
+                self.log(f"Строк сценария в plan.xml: {len(plan_modules)}")
+                self._log_plan_skipped(tmp_path, plan_modules)
+            except Exception as e:
+                raise Exception(f"Не удалось загрузить plan.xml: {e}") from e
+            finally:
+                # v1.66: соединение и временный файл закрываются/удаляются ДО
+                # открытия диалога редактора — закрытие SSH после exec() диалога
+                # приводило к аварийному завершению приложения.
+                try:
+                    ssh.close()
+                except Exception:
                     pass
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        else:
+            # v1.73: тихий режим (Автопрошивка) — план только что создан
+            # MakePlan'ом, но для сборки СП достаточно информации о модулях;
+            # пути заполнит автозаполнение appl.
+            self.log("Тихий режим: plan.xml не выгружается — "
+                     "сценарий будет собран автозаполнением")
         self.progress_signal.emit(100)
         self.log(f"Данные для редактора подготовлены. Модулей: {len(modules_info)}, прошивок: {len(firmwares)}")
         self.finished_signal.emit(True, "Данные получены", {
@@ -1466,6 +1489,28 @@ class OperationWorker(QThread):
             self.log(f"ВНИМАНИЕ: пропущено записей plan.xml с некорректным "
                      f"module_slot: {skipped} (из {total}) — их пути не будут "
                      f"подхвачены редактором")
+
+    def _cleanup_remote_agent(self):
+        """v1.73: удаление директории агента и прошивок с контроллера.
+
+        Используется операцией «Удалить агента» (op 12) и Автопрошивкой на
+        финальном этапе / при ошибке. Ошибки подключения не считаются
+        критичными — операция считается выполненной best-effort.
+        """
+        ssh = SSHClient(self.config['ip'], self.config['password'])
+        ssh.connect()
+        try:
+            self.log("Удаление каталога /home/user/fw_update/...")
+            ssh.exec_command("rm -rf /home/user/fw_update")
+            if ssh.sftp_stat("/home/user/fw_update"):
+                raise Exception("Каталог /home/user/fw_update не удалён")
+            self.progress_signal.emit(100)
+            self.log("Директория агента и прошивок удалена с контроллера")
+        finally:
+            try:
+                ssh.close()
+            except Exception:
+                pass
 
     def _op1_upload_agent(self, ssh):
         self.log("Очистка и создание каталогов...")
@@ -1766,6 +1811,118 @@ class OperationWorker(QThread):
         # _op11_prepare_edit_plan (без SSH-потока в момент открытия диалога).
         self._op11_prepare_edit_plan()
 
+    # ---------------------------------------------------------------
+    # v1.73: Автопрошивка — шаг 6 цепочки (сохранение СП + Update)
+    # ---------------------------------------------------------------
+
+    def _op13_auto_flash_tail(self, ssh):
+        """Шаг 6 Автопрошивки: сохранение собранного тихим редактором СП
+        (rows) как plan.xml на устройство и запуск прошивки (Update).
+
+        Строки сценария (с заполненными путями appl и типами) приходят из
+        GUI-шага тихого редактора через config['_auto_rows']. Диалог
+        результата показывается в GUI после успешного завершения шага."""
+        rows = self.config.get('_auto_rows') or []
+        selected = [r for r in rows if r.get('path')]
+        if not selected:
+            raise Exception("Автопрошивка: сценарий пуст — нет строк "
+                            "с указанными путями прошивок")
+
+        # Контроль формата имён (включённый блокирует невалидные имена/full)
+        format_control = bool(self.config.get('format_control', True))
+        for row in selected:
+            fname = os.path.basename(row['path'])
+            info = parse_firmware_filename(fname)
+            parsed_ok = info is not None
+            src = detect_fw_source(row['path'])
+            if format_control:
+                if not parsed_ok:
+                    raise Exception(
+                        f"Автопрошивка: файл '{fname}' не прошёл контроль "
+                        f"формата имени")
+                if src == 'full':
+                    raise Exception(
+                        f"Автопрошивка: файл '{fname}' имеет формат full — "
+                        "он пока не поддерживается")
+            elif not parsed_ok or src == 'full':
+                self.log(f"ВНИМАНИЕ: файл '{fname}' "
+                         + ("имеет формат full (не поддерживается)"
+                            if src == 'full' else "имеет некорректное имя")
+                         + " — прошивается при отключённом контроле формата")
+
+        # Запись plan.xml (<Root>, type="appl") на устройство
+        xml_lines = ['<Root>']
+        for row in selected:
+            img_type = row.get('img_type', 'apply')
+            xml_lines.append(
+                f'  <Image module_slot="{row["slot"]}" '
+                f'module_type="{row["module_type"]}" '
+                f'path="{row["path"]}" '
+                f'type="{"boot" if img_type == "boot" else "appl"}" />')
+        xml_lines.append('</Root>')
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', delete=False,
+                suffix='.xml') as tmp:
+            tmp.write('\n'.join(xml_lines))
+            local_plan = tmp.name
+        try:
+            self.log(f"Запись plan.xml на устройство "
+                     f"(строк сценария: {len(selected)})...")
+            ssh.sftp_put(local_plan, "/home/user/fw_update/plan.xml")
+            ssh.exec_command("chmod 644 /home/user/fw_update/plan.xml")
+        finally:
+            self._safe_remove(local_plan)
+        self.progress_signal.emit(20)
+
+        # Прошивка (Update)
+        self.log("--- Автопрошивка: запуск прошивки (Update) ---")
+        self._op6_update(ssh)
+        self.progress_signal.emit(100)
+
+    def _op13_quiet_save(self):
+        """v1.73: тихое сохранение собранного СП на устройство без SSH-потока.
+
+        Используется шагом 3 цепочки Автопрошивки (данные подготовлены
+        воркером op 11, строки сценария — в config['_auto_rows']). Диалог
+        редактора при этом не открывается."""
+        rows = self.config.get('_auto_rows') or []
+        selected = [r for r in rows if r.get('path')]
+        if not selected:
+            raise Exception("Автопрошивка: автозаполнение appl не выбрало ни "
+                            "одного модуля — прошивать нечего")
+        root = ET.Element("Root")
+        for row in selected:
+            img_type = row.get('img_type', 'apply')
+            ET.SubElement(root, "Image", {
+                "module_slot": str(row['slot']),
+                "module_type": str(row['module_type']),
+                "path": str(row['path']),
+                "type": "appl" if img_type != "boot" else "boot",
+            })
+        tree = ET.ElementTree(root)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+            tmp_path = tmp.name
+        try:
+            tree.write(tmp_path, encoding='utf-8', xml_declaration=True)
+            ssh = SSHClient(self.config['ip'], self.config['password'])
+            try:
+                ssh.connect()
+                self.log(f"Тихое сохранение plan.xml "
+                         f"(строк сценария: {len(selected)})...")
+                ssh.sftp_put(tmp_path, "/home/user/fw_update/plan.xml")
+            finally:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        self.progress_signal.emit(100)
+        self.finished_signal.emit(True, "СП сохранён (тихий режим)", {})
+
     @staticmethod
     def _safe_remove(path):
         try:
@@ -1889,8 +2046,11 @@ class EditSPDialog(QDialog):
     COL_DATE = 7
     COL_COUNT = 8
 
-    def __init__(self, modules_info, plan_modules, firmwares, config, parent=None):
+    def __init__(self, modules_info, plan_modules, firmwares, config,
+                 parent=None, quiet=False):
         super().__init__(parent)
+        # v1.73: тихий режим (Автопрошивка) — без диалоговых окон
+        self.quiet = quiet
         self.setWindowTitle("Редактирование сценария прошивки")
         self.resize(1600, 820)
         self.config = config
@@ -2362,7 +2522,7 @@ class EditSPDialog(QDialog):
         # подходящие строки (flashable + непустой путь)
         self.deselect_all()
         self.select_all()
-        if not os.environ.get("MFC_TESTS_NO_MSGBOX"):
+        if not self.quiet and not os.environ.get("MFC_TESTS_NO_MSGBOX"):
             QMessageBox.information(
                 self, "Автозаполнение",
                 f"Тип прошивки: {display_img_type(want_type)}. "
@@ -2501,7 +2661,7 @@ class EditSPDialog(QDialog):
                 cb.setChecked(True)
                 changed += 1
             self._update_row(i)
-        if changed == 0 and not any(
+        if changed == 0 and not self.quiet and not any(
                 self._is_selectable(i) and
                 (str(self.rows[i].get("module_type") or "").strip().upper()
                  in (want, "PSU" if want == "POWER_UNIT" else want))
@@ -2552,6 +2712,11 @@ class EditSPDialog(QDialog):
         return True, ""
 
     def apply_edit(self):
+        # v1.73: метод сохранён как алиас — кнопка «Сохранить» вызывает его;
+        # цепочка Автопрошивки использует apply_edits().
+        self.apply_edits()
+
+    def apply_edits(self):
         selected = []
         for i, row in enumerate(self.rows):
             if not self.checkboxes[i].isChecked():
@@ -2559,14 +2724,17 @@ class EditSPDialog(QDialog):
             if not row.get("flashable", True):
                 # Защита от программной установки галочки — такой модуль не прошивается
                 reason = row.get("unflash_reason") or "прошивка невозможна"
-                QMessageBox.critical(
-                    self, "Ошибка валидации",
-                    f"Слот {row['slot']}: {reason} — прошивка невозможна")
+                msg = f"Слот {row['slot']}: {reason} — прошивка невозможна"
+                if self.quiet:
+                    raise Exception(msg)
+                QMessageBox.critical(self, "Ошибка валидации", msg)
                 return
             row['path'] = self.path_edits[i].text().strip()
             row['img_type'] = self.type_combos[i].currentData()
             ok, err = self._validate_row(i)
             if not ok:
+                if self.quiet:
+                    raise Exception(err)
                 QMessageBox.critical(self, "Ошибка валидации", err)
                 return
             selected.append(row)
@@ -2575,17 +2743,22 @@ class EditSPDialog(QDialog):
         # форматом full при отключённом контроле) — показываем одним окном,
         # сохранение при этом возможно.
         if self.warnings:
-            ret = QMessageBox.warning(
-                self, "Предупреждения формата прошивок",
-                "Контроль формата отключен, в сценарий попадают файлы:\n"
-                + "\n".join(self.warnings[:20])
-                + ("\n..." if len(self.warnings) > 20 else "")
-                + "\n\nСохранить сценарий?")
-            self.warnings = []
-            if ret != QMessageBox.StandardButton.Yes:
-                return
+            if self.quiet:
+                # v1.73 (Автопрошивка): диалогов нет — предупреждения
+                # подтверждаются автоматически, сохранение выполняется.
+                self.warnings = []
+            else:
+                ret = QMessageBox.warning(
+                    self, "Предупреждения формата прошивок",
+                    "Контроль формата отключен, в сценарий попадают файлы:\n"
+                    + "\n".join(self.warnings[:20])
+                    + ("\n..." if len(self.warnings) > 20 else "")
+                    + "\n\nСохранить сценарий?")
+                self.warnings = []
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
 
-        if not selected:
+        if not selected and not self.quiet:
             # v1.69: пустой сценарий сохраняется по требованию заказчика —
             # предупреждение показывается, но запись plan.xml выполняется
             # (создаётся пустой <Root/>).
@@ -2596,6 +2769,10 @@ class EditSPDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if ret != QMessageBox.StandardButton.Yes:
                 return
+        elif not selected and self.quiet:
+            # v1.73: в тихом режиме пустой СП — ошибка Автопрошивки
+            raise Exception("Автопрошивка: автозаполнение appl не выбрало ни "
+                            "одного модуля — прошивать нечего")
 
         # Корень сценария прошивки — <Root> (по требованию бэкенда; раньше был <Plan>)
         # Тип образа 'apply' записывается в файл как 'appl' (требование бэкенда).
@@ -2723,7 +2900,11 @@ class MainWindow(QMainWindow):
             (2, "Создать СП", "col2_btn_2"),
             (3, "Импортировать СП", "col2_btn_3"),
             (4, "Экспортировать СП", "col2_btn_4"),
-            (9, "Редактировать СП", "col2_btn_9")
+            (9, "Редактировать СП", "col2_btn_9"),
+            # v1.73: удаление директории агента и прошивок с контроллера
+            (12, "Удалить агента", "col2_btn_12"),
+            # v1.73: последовательная цепочка «под ключ» в тихом режиме
+            (13, "Автопрошивка", "col2_btn_13")
         ]
         for i, (op_id, text, obj_name) in enumerate(col2_ops):
             btn = QPushButton(text)
@@ -2933,12 +3114,57 @@ class MainWindow(QMainWindow):
             if not config['plan_xml']:
                 QMessageBox.critical(self, "Ошибка", "Укажите файл сценария!")
                 return
+        elif op_id == 12 and getattr(self, "_auto_step", 0) == 0:
+            # В цепочке Автопрошивки (шаг 6) подтверждение не запрашивается
+            reply = QMessageBox.warning(
+                self, "Предупреждение",
+                "Директория /home/user/fw_update/ будет удалена с "
+                "контроллера. Продолжить?",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            if reply == QMessageBox.StandardButton.Cancel:
+                self._auto_finish(getattr(self, "_auto_failed_step", None)) \
+                    if getattr(self, "_auto_step", 0) else None
+                return
+        elif op_id == 13:
+            # v1.73: Автопрошивка — предварительная проверка конфигурации
+            if not config['agent_dir'] or not config['firmware_dir']:
+                QMessageBox.critical(self, "Ошибка",
+                                     "Укажите файлы/директории агента и прошивок!")
+                return
+            if self._auto_step == 0:
+                # Старт цепочки (кнопка «Автопрошивка»)
+                self._auto_failed = False
+                self._auto_rows = None
+                self.append_log("=== АВТОПРОШИВКА: запуск цепочки операций ===")
+
+        # v1.73: при старте цепочки сразу запускаем шаг 1 (воркер не
+        # создаётся — реальную работу выполняют шаги 1..6)
+        if op_id == 13 and getattr(self, "_auto_step", 0) <= 1:
+            self._auto_step = 1
+            self._auto_run_step()
+            return
+
+        # v1.73: шаги 4..6 выполняются внутри цепочки (_auto_step > 0) без
+        # интерактивных подтверждений (тихий режим Автопрошивки).
+        in_auto_chain = getattr(self, "_auto_step", 0) > 0
 
         self.progress_bar.setValue(0)
         op_name = next((name for oid, name in self.all_ops if oid == op_id), f"ID {op_id}")
-        self.append_log(f"--- Запущена операция: {op_name} ---")
+        if not in_auto_chain:
+            self.append_log(f"--- Запущена операция: {op_name} ---")
 
-        self.worker = OperationWorker(op_id, config)
+        # v1.73: цепочка шагов запускается напрямую воркером соответствующей
+        # операции; для шага записи СП+Update используется op 13 с данными
+        # тихого редактора (_auto_rows).
+        cfg = dict(config)
+        quiet = in_auto_chain
+        worker_op = op_id
+        if op_id == 13 and in_auto_chain:
+            cfg['_auto_rows'] = getattr(self, "_auto_rows", None) or []
+            # Шаг 4 цепочки — запись plan.xml + Update; шаг 3 — тихое
+            # сохранение СП без SSH-потока (данные подготовлены на шаге 3).
+            cfg['_auto_update'] = (self._auto_step == 4)
+        self.worker = OperationWorker(worker_op, cfg, quiet=quiet)
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_operation_finished)
@@ -2946,13 +3172,122 @@ class MainWindow(QMainWindow):
         self._set_ops_enabled(False)
         self.worker.start()
 
+    # ---------------------------------------------------------------
+    # v1.73: Автопрошивка — последовательная цепочка операций (кнопка
+    #   «Автопрошивка», op_id 13 как точка входа):
+    #   1. Внедрение агента и прошивок (тихий режим, без диалогов)
+    #   2. Создать СП (MakePlan)
+    #   3. Подготовка данных редактора + тихий редактор: автозаполнение
+    #      appl и сохранение СП в памяти
+    #   4. Запись собранного СП (plan.xml) и прошивка (Update) — op 13
+    #   5. Просмотр результата (диалог показывается)
+    #   6. Удалить директорию агента и прошивок с контроллера
+    # На любом сбое — причина в оперативном логе и попытка удалить
+    # директорию агента (шаг 6 выполняется даже при ошибке).
+    # ---------------------------------------------------------------
+    AUTO_STEPS = {
+        1: "Внедрить агента и прошивки",
+        2: "Создать СП",
+        3: "Редактировать СП (тихий режим)",
+        4: "Запустить прошивку",
+        5: "Просмотр результата",
+        6: "Удалить агента и прошивки",
+    }
+
+    def _auto_run_step(self):
+        """Запускает очередной шаг цепочки Автопрошивки через start_operation."""
+        step = self._auto_step
+        name = self.AUTO_STEPS.get(step, "")
+        self.append_log(f"[Автопрошивка] Шаг {step}/6: {name}")
+        op_map = {1: 1, 2: 2, 3: 11, 4: 13, 5: 8, 6: 12}
+        # Для шага 3 внутри start_operation(13) создаётся воркер op 11
+        self.start_operation(op_map[step])
+
+    def _auto_finish(self, reason=None):
+        """Завершение цепочки: разблокировка кнопок и итоговое сообщение."""
+        self._auto_step = 0
+        self._auto_rows = None
+        self._set_ops_enabled(True)
+        if reason:
+            self.append_log(f"=== АВТОПРОШИВКА ПРЕРВАНА: {reason} ===")
+        else:
+            self.append_log("=== АВТОПРОШИВКА ЗАВЕРШЕНА УСПЕШНО ===")
+
+    def _auto_abort(self, reason):
+        """Сбой шага: фиксируем причину и пытаемся удалить директорию агента."""
+        self._auto_failed = True
+        self.append_log(f"[Автопрошивка] СБОЙ: {reason}")
+        QMessageBox.critical(self, "Автопрошивка", f"Сбой: {reason}")
+        self._auto_step = 6  # попытка очистки best-effort
+        self._auto_failed_step = reason
+        try:
+            self._auto_run_step()
+        except Exception as e:
+            self._auto_finish(f"{reason} (очистка не выполнена: {e})")
+
+    def _auto_flash_step_done(self, success, message, data):
+        """Обработка завершения одного шага Автопрошивки."""
+        step = self._auto_step
+        if not success and step != 6:
+            self._auto_abort(message or f"ошибка на шаге {step}")
+            return
+        if step == 6:
+            # Очистка — финальный шаг цепочки (успех или best-effort)
+            if self._auto_failed:
+                self._auto_finish(getattr(self, "_auto_failed_step", None))
+            else:
+                if not success:
+                    self.append_log("[Автопрошивка] ВНИМАНИЕ: директорию "
+                                    "агента удалить не удалось — выполните "
+                                    "«Удалить агента» вручную")
+                self._auto_finish()
+            return
+        if step == 3:
+            # Тихий редактор: данные подготовлены — собираем СП без открытия
+            # диалога (автозаполнение appl + валидация строк), затем тихое
+            # сохранение plan.xml на устройство (шаг выполняется воркером).
+            try:
+                dialog = EditSPDialog(
+                    data["modules_info"], data["plan_modules"],
+                    data["firmwares"], self.get_current_config(), self,
+                    quiet=True)
+                dialog.autofill("apply")
+                rows = [dict(r) for r in dialog.rows]
+                for i, r in enumerate(rows):
+                    r['path'] = dialog.path_edits[i].text().strip()
+                    r['img_type'] = dialog.type_combos[i].currentData()
+                del dialog
+                if not any(r.get('path') and r.get('flashable', True)
+                           for r in rows):
+                    raise Exception("Автопрошивка: автозаполнение appl не "
+                                    "выбрало ни одного модуля — "
+                                    "прошивать нечего")
+                self._auto_rows = rows
+            except Exception as e:
+                self._auto_abort(f"Ошибка тихого редактирования СП: {e}")
+                return
+            self._auto_step += 1
+            self._auto_run_step()
+            return
+        # Шаги 1, 2, 4, 5 — переход к следующему
+        if step == 5 and success:
+            # результат показан в диалоге — затем очистка
+            pass
+        self._auto_step += 1
+        self._auto_run_step()
+
     def on_operation_finished(self, success, message, data):
         # v1.66: разблокировка кнопок выполняется в любом случае (finally),
         # чтобы исключение при открытии диалога не «замораживало» интерфейс.
         try:
+            # v1.73: обработка шагов цепочки «Автопрошивка»
+            if getattr(self, "_auto_step", 0) > 0:
+                self._auto_flash_step_done(success, message, data)
+                return
             self._handle_operation_result(success, message, data)
         finally:
-            self._set_ops_enabled(True)
+            if getattr(self, "_auto_step", 0) == 0:
+                self._set_ops_enabled(True)
 
     def _handle_operation_result(self, success, message, data):
         if not success:
@@ -2969,8 +3304,11 @@ class MainWindow(QMainWindow):
                 data["plan_modules"],
                 data["firmwares"],
                 self.get_current_config(),
-                self
+                self,
+                # v1.73: тихий режим для Автопрошивки (без диалогов)
+                quiet=getattr(self, "_auto_step", 0) > 0
             )
+            self._auto_edit_dialog = dialog
             result = dialog.exec()
             if hasattr(self, '_pending_make_plan') and self._pending_make_plan:
                 self._pending_make_plan = False
