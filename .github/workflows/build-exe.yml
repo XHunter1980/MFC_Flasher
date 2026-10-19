@@ -72,17 +72,64 @@ jobs:
           path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
 
-      - name: Создание релиза с .exe (при пуше тега)
+      - name: Создание релиза и загрузка .exe через REST API (при пуше тега)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ steps.ver.outputs.exe }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-          token: ${{ secrets.GITHUB_TOKEN }}
+        # Примечание: ранее использовался softprops/action-gh-release@v2, но он
+        # создавал «битые» ассеты (ссылка на скачивание отдавала 404 — файлы не
+        # догружались до CDN). Прямая загрузка через uploads.github.com даёт
+        # рабочий ассет; шаг проверяет размер загруженного файла.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          EXE: ${{ steps.ver.outputs.exe }}
+        run: |
+          set -euo pipefail
+          BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
+          # 1) Релиз по тегу (если уже существует — берём существующий)
+          HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}")
+          if [ "$HTTP" != "201" ]; then echo "Релиз уже существует (HTTP $HTTP), использую его"; fi
+          RELEASE_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+            | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          # 2) Если ассет с таким именем уже есть (например, битый) — удаляем
+          ASSET_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/$RELEASE_ID/assets" \
+            | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
+          if [ -n "$ASSET_ID" ]; then
+            curl -sf -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" || true
+          fi
+          # 3) Загрузка exe на uploads.github.com (Content-Length обязателен)
+          SIZE=$(stat -c%s "dist/$EXE" 2>/dev/null || wc -c < "dist/$EXE")
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -H "Content-Length: $SIZE" \
+            --data-binary "@dist/$EXE" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$EXE" > /tmp/asset.json
+          UPLOADED=$(python -c "import json; print(json.load(open('/tmp/asset.json'))['size'])")
+          echo "Загружено байт: $UPLOADED (ожидалось $SIZE)"
+          if [ "$UPLOADED" != "$SIZE" ]; then echo "::error::Размер ассета не совпадает"; exit 1; fi
+          URL=$(python -c "import json; print(json.load(open('/tmp/asset.json'))['browser_download_url'])")
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
+          echo "Проверка доступности: HTTP $CODE для $URL"
+          if [ "$CODE" != "206" ] && [ "$CODE" != "200" ]; then echo "::error::Ассет недоступен для скачивания"; exit 1; fi
+          echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Запасной релиз через REST API (если action не смог)
+      - name: Артефакт и для сборки по тегу (резервная копия exe)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
+          path: dist/${{ steps.ver.outputs.exe }}
+          if-no-files-found: error
+
+      - name: Запасной релиз через REST API (если основной шаг не смог)
         if: failure() && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
