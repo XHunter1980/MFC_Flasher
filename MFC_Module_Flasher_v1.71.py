@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.70"
+APP_VERSION = "1.71"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -214,10 +214,21 @@ class BackendClient:
     """
     Клиент для работы с HTTP-бэкендом устройства.
     Реализует двухшаговую авторизацию с защитой от бесконечной рекурсии.
+    API-путь фиксирован (v1.71): /vx3/backend.fcgi — поле ввода убрано из UI.
     """
-    def __init__(self, ip, api_path="/vx3/backend.fcgi", log_callback=None):
+    # Детализация HTTP-протокола (v1.71): в кратком режиме операционного
+    # лога эти строки не показываются (полные — в файле http_debug.log).
+    _DETAIL_MARKERS = ("Payload:", "Заголовки ответа:", "Тело ответа",
+                       "Статус: 200", "--- ШАГ", "URL:",
+                       "Актуальный SID:", "Актуальный токен:")
+
+    # Фиксированный API-путь бэкенда (v1.71: поле ввода убрано из UI)
+    API_PATH = "/vx3/backend.fcgi"
+
+    def __init__(self, ip, log_callback=None, verbose=False):
+        self.verbose = verbose
         self.ip = ip
-        self.api_path = api_path if api_path.startswith('/') else '/' + api_path
+        self.api_path = self.API_PATH
         self.api_url = f"http://{ip}{self.api_path}"
         self.base_url = f"http://{ip}/vx3/"
         self.cookie_jar = http.cookiejar.CookieJar()
@@ -242,7 +253,12 @@ class BackendClient:
                 f.write(line + "\n")
         except Exception:
             pass
-        if self.log_callback:
+        # v1.71: детализация HTTP (Payload, заголовки/тело ответа, статусы,
+        # шаги запросов) передается в операционный журнал только в подробном
+        # режиме; в http_debug.log пишутся всегда.
+        if self.log_callback and (self.verbose or
+                                  not any(m in msg for m in
+                                          self._DETAIL_MARKERS)):
             self.log_callback(msg)
 
     def _base_headers(self):
@@ -573,32 +589,73 @@ def agent_executable(agent_path_value):
     return agent_path_value
 
 
-def fw_name_format(filename):
-    """Формат имени файла прошивки по префиксу директории/имени.
+def fw_name_format(filename, parsed=None):
+    """Полный контроль формата имени файла прошивки.
 
-    Правила (требования заказчика):
+    Правила (требования заказчика, v1.71):
       - допустимые префиксы: 'appl', 'boot', 'full' (регистронезависимо);
       - 'full' — формат пока не поддерживается;
-      - имя без известного префикса — некорректный формат.
+      - имя без известного префикса — некорректное имя;
+      - НЕКОРРЕКТНЫМ считается также имя, в котором парсер не может
+        обнаружить тип модуля, версию или тип прошивки (например
+        'appl_atb3500_ai8_r.bin' — нет версии и даты).
+
+    parsed — результат parse_firmware_filename (или заполненный вручную
+    словарь скана); если не передан, имя разбирается самостоятельно.
 
     Возвращает кортеж (fmt, ok, supported, warning):
       fmt       — распознанный префикс ('appl'/'boot'/'full'/None);
       ok        — префикс корректен (один из appl/boot/full);
-      supported — прошивка файлом разрешена при включённой опции
-                  «Контроль формата прошивок» (ok и не 'full');
+      supported — прошивка/загрузка файлом разрешена при включённой опции
+                  «Контроль формата прошивок» (полный контроль пройден и
+                  не 'full');
       warning   — текст предупреждения или None.
     """
     base = os.path.basename((filename or '').replace('\\', '/')).lower()
+    fmt = None
     for prefix in ("appl", "boot", "full"):
         if base.startswith(prefix):
-            if prefix == "full":
-                return ("full", True, False,
-                        f"Файл '{filename}' имеет формат full — "
-                        "такой формат пока не поддерживается")
-            return (prefix, True, True, None)
-    return (None, False, False,
-            f"Файл '{filename}' имеет некорректное имя: ожидается начало "
-            "'appl', 'boot' или 'full'")
+            fmt = prefix
+            break
+    if fmt is None:
+        return (None, False, False,
+                f"Файл '{filename}' имеет некорректное имя: ожидается начало "
+                "'appl', 'boot' или 'full'")
+    if fmt == "full":
+        return ("full", True, False,
+                f"Файл '{filename}' имеет формат full — "
+                "такой формат пока не поддерживается")
+
+    # Полный контроль состава имени (v1.71): тип модуля, версия, тип прошивки
+    if parsed is None:
+        parsed = parse_firmware_filename(os.path.basename(filename or ''))
+    # Результат строгого контроля из скана firmware_dir (fmt_ok) имеет приоритет:
+    # скан уже разобрал имя и заполнил поля минимально.
+    if isinstance(parsed, dict) and 'fmt_ok' in parsed:
+        if parsed['fmt_ok']:
+            return (fmt, True, True, None)
+        return (fmt, True, False,
+                f"Файл '{filename}' имеет некорректное имя "
+                "(парсер не обнаружил версию/тип модуля/тип прошивки)")
+    mt = str((parsed or {}).get('module_type') or '').strip().upper()
+    ver = normalize_fw_version((parsed or {}).get('version'))
+    date_ = str((parsed or {}).get('date') or '').strip()
+    ftpc = (parsed or {}).get('fw_type')
+    problems = []
+    if not mt or mt == "N/A":
+        problems.append("тип модуля не определён")
+    if ver == "N/A":
+        problems.append("версия не обнаружена")
+    if not date_ or date_ == "N/A":
+        problems.append("дата не обнаружена")
+    if ftpc not in ("apply", "boot"):
+        problems.append("тип прошивки не определён")
+    if problems:
+        return (fmt, True, False,
+                f"Файл '{filename}' имеет некорректное имя: "
+                + ", ".join(problems) +
+                " (ожидаются сегменты R<маж>_<мин>_<ДДММГГ>)")
+    return (fmt, True, True, None)
 
 
 def parse_firmware_filename(filename):
@@ -829,7 +886,8 @@ class OperationWorker(QThread):
             # прошедшие проверку, на устройство не дозагружаются; при
             # отключённом контроле — только предупреждение, дозагрузка
             # выполняется (включая формат full).
-            _fmt, _ok, _supported, warning = fw_name_format(fw['filename'])
+            _fmt, _ok, _supported, warning = fw_name_format(
+                fw['filename'], parsed=fw)
             if not _supported:
                 if bool(self.config.get('format_control', True)):
                     raise Exception(
@@ -848,6 +906,32 @@ class OperationWorker(QThread):
                  f"дозагружено {uploaded}")
         # Возвращаем слоты из сценария — нужны для анализа operation.log
         return [m['slot'] for m in plan_modules]
+
+    def _remote_get_text(self, ssh, remote_path):
+        """Чтение текстового файла с устройства (exec cat).
+
+        v1.71: отсутствующий файл больше не критическая ошибка — пустой
+        ответ трактуется как «файл ещё не создан» (решает оператор).
+        """
+        stdin, stdout, stderr = ssh.client.exec_command(f"cat {remote_path}")
+        content = stdout.read().decode('utf-8', errors='ignore')
+        if not content.strip():
+            self.log(f"Файл {remote_path} на устройстве отсутствует "
+                     "или пуст — возможно, операция ещё не выполнялась")
+        return content
+
+    def _ensure_remote_file(self, ssh, remote_path, what):
+        """Проверка существования файла на устройстве (v1.71).
+
+        Вместо падения с 'No such file' — понятное сообщение о том, что
+        файл ещё не создан, и корректное завершение операции.
+        """
+        if ssh.sftp_stat(remote_path):
+            return True
+        self.log(f"{what} ({remote_path}) ещё не создан на устройстве — "
+                 "сначала выполните соответствующую операцию "
+                 "(Внедрить агента и прошивки / Создать СП / Прошивка)")
+        return False
 
     def _stop_services(self, ssh):
         self.log("Остановка PrjA.service...")
@@ -918,8 +1002,8 @@ class OperationWorker(QThread):
         self.log("Получение информации о модулях через HTTP...")
         client = BackendClient(
             self.config['ip'],
-            self.config.get('api_path', '/vx3/backend.fcgi'),
-            log_callback=self.log
+            log_callback=self.log,
+            verbose=self.verbose_log
         )
         data = client.request("IskraIOGetAll")
         if data.get("result") != 0:
@@ -1193,14 +1277,19 @@ class OperationWorker(QThread):
             subdir = "" if rel_dir == "." else rel_dir
             for filename in sorted(files):
                 full_path = os.path.join(root, filename)
-                fmt, ok, _supported, warning = fw_name_format(filename)
+                fmt, ok, supported, warning = fw_name_format(filename)
                 if not ok:
-                    # Файлы с некорректным именем (без префикса appl/boot/full)
-                    # в скан не попадают; для .bin — предупреждение, остальные
-                    # файлы (конфиги, readme и т.п.) пропускаются молча.
+                    # Файлы без префикса appl/boot/full в скан не попадают;
+                    # для .bin — предупреждение, остальные файлы (конфиги,
+                    # readme и т.п.) пропускаются молча.
                     if filename.lower().endswith(".bin"):
                         self.log(f"Предупреждение: {warning}")
                     continue
+                # v1.71: строгий контроль формата — supported=False означает,
+                # что парсер не обнаружил версию/тип модуля/тип прошивки
+                # (или это full). Такие файлы остаются в скане (их можно
+                # выбрать вручную), но при включённом контроле формата они
+                # не загружаются на устройство и не прошиваются.
                 parsed = parse_firmware_filename(filename)
                 if parsed is None:
                     # Имя корректного формата, но не проходит строгий шаблон
@@ -1228,6 +1317,15 @@ class OperationWorker(QThread):
                         "filename": filename,
                     }
                 parsed["local_path"] = full_path
+                # v1.71: флаг строгого контроля формата — результат ПОЛНОГО
+                # контроля имени (fw_name_format), а не только префикса:
+                # supported=False, если парсер не обнаружил версию/тип
+                # модуля/тип прошивки/дату или это 'full'. При включённом
+                # контроле такие файлы не загружаются и не прошиваются.
+                _fmt, _ok, _supported, _warn = fw_name_format(filename, parsed=parsed)
+                parsed["fmt_ok"] = bool(_supported)
+                if not _supported and _warn:
+                    self.log(f"Предупреждение: {_warn}")
                 parsed["source"] = detect_fw_source(subdir) or \
                     detect_fw_source(filename) or ("full" if fmt == "full" else
                                                    ("boot" if fmt == "boot" else "apply"))
@@ -1340,11 +1438,12 @@ class OperationWorker(QThread):
         full_names = []
         kept = []
         for fw in firmwares:
-            fmt, ok, supported, warning = fw_name_format(fw['filename'])
-            if not ok:
-                bad_names.append(fw['filename'])
-            elif fmt == 'full':
+            fmt, ok, supported, warning = fw_name_format(
+                fw['filename'], parsed=fw)
+            if fmt == 'full':
                 full_names.append(fw['filename'])
+            elif not supported:
+                bad_names.append(fw['filename'])
             if fc_on and not supported:
                 continue
             kept.append(fw)
@@ -1371,15 +1470,16 @@ class OperationWorker(QThread):
                          f"допускается (с предупреждением).")
             if self.verbose_log:
                 if bad_names:
-                    self.log("Некорректные имена (без префикса appl/boot/"
-                             "full): " + ", ".join(bad_names))
+                    self.log("Некорректные имена (парсер не обнаруживает "
+                             "версию/тип модуля/тип прошивки): "
+                             + ", ".join(bad_names))
                 if full_names:
                     self.log("Файлы формата full: " + ", ".join(full_names))
-        elif self.verbose_log:
-            for fw in firmwares:
-                _f, _o, _s, warning = fw_name_format(fw['filename'])
-                if warning:
-                    self.log(f"Предупреждение: {warning}")
+        # v1.71: при включённой детализации показываем имена ВСЕХ
+        # загружаемых прошивок
+        if self.verbose_log:
+            self.log("Загружаются прошивки: " +
+                     ", ".join(fw['filename'] for fw in firmwares))
         firmwares = kept
         total = len(firmwares)
         if total == 0:
@@ -1406,7 +1506,9 @@ class OperationWorker(QThread):
             out, err = ssh.exec_command("cd /home/user/fw_update && ./IskraIO_Util MakePlan")
             if err:
                 self.log(f"MakePlan stderr: {err}")
-            self.log(f"MakePlan stdout: {out}")
+            # v1.71: stdout MakePlan — только в режиме детализации
+            if self.verbose_log:
+                self.log(f"MakePlan stdout: {out}")
             self.log("MakePlan завершён")
         except Exception as e:
             self.log(f"Ошибка во время MakePlan: {e}")
@@ -1421,6 +1523,13 @@ class OperationWorker(QThread):
             self.log("Операция создания СП завершена")
 
     def _op3_import_plan(self, ssh):
+        # v1.71: отсутствующий локальный plan.xml — не критическая ошибка
+        local_plan = self.config.get('plan_xml', '')
+        if not local_plan or not os.path.isfile(local_plan):
+            self.log(f"Файл сценария прошивки ещё не создан "
+                     f"(путь: '{local_plan or 'не задан'}') — сначала "
+                     "выполните 'Создать СП' или 'Редактировать СП'")
+            return
         self.log("Проверка наличия текущего plan.xml...")
         if ssh.sftp_stat("/home/user/fw_update/plan.xml"):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1434,6 +1543,10 @@ class OperationWorker(QThread):
         self.log("Сценарий успешно импортирован")
 
     def _op4_export_plan(self, ssh):
+        # v1.71: отсутствующий plan.xml на устройстве — не критическая ошибка
+        if not self._ensure_remote_file(ssh, "/home/user/fw_update/plan.xml",
+                                        "Сценарий прошивки (plan.xml)"):
+            return
         self.log("Выгрузка plan.xml...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_path = os.path.join(agent_work_dir(self.config['agent_dir']), f"plan_export_{timestamp}.xml")
@@ -1532,6 +1645,10 @@ class OperationWorker(QThread):
             self._start_services(ssh)
 
     def _op7_download_dump(self, ssh):
+        # v1.71: отсутствующий дамп — не критическая ошибка
+        if not self._ensure_remote_file(ssh, "/home/user/fw_update/io.can.box2.csv",
+                                        "Дамп операции (io.can.box2.csv)"):
+            return
         self.log("Выгрузка дампа операции...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_dump = os.path.join(agent_work_dir(self.config['agent_dir']), f"io_can_box2_{timestamp}.csv")
@@ -1541,13 +1658,20 @@ class OperationWorker(QThread):
 
     def _op8_view_result(self, ssh):
         self.log("Чтение данных для анализа результата...")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-            tmp_plan = tmp.name
-        ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_plan)
-        modules = parse_plan_xml(tmp_plan)
-        os.remove(tmp_plan)
-        stdin, stdout, stderr = ssh.client.exec_command("cat /home/user/fw_update/result.txt")
-        result_content = stdout.read().decode()
+        # v1.71: отсутствующие plan.xml / result.txt / operation.log — не
+        # критическая ошибка: показываем то, что есть, с пометкой 'нет информации'
+        if not self._ensure_remote_file(ssh, "/home/user/fw_update/plan.xml",
+                                        "Сценарий прошивки (plan.xml)"):
+            modules = []
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                tmp_plan = tmp.name
+            try:
+                ssh.sftp_get("/home/user/fw_update/plan.xml", tmp_plan)
+                modules = parse_plan_xml(tmp_plan)
+            finally:
+                self._safe_remove(tmp_plan)
+        result_content = self._remote_get_text(ssh, "/home/user/fw_update/result.txt")
         results = parse_result_txt(result_content)
         # Анализ operation.log (локального выгруженного или с устройства):
         # различаем 'нет информации' и 'ошибка'
@@ -1799,6 +1923,11 @@ class EditSPDialog(QDialog):
             path_layout.setSpacing(2)
             path_edit = QLineEdit(row['path'])
             path_edit.editingFinished.connect(lambda idx=i: self._on_path_changed(idx))
+            # v1.71: пустой путь — выбор снят и неактивен; реагируем и на
+            # ввод текста (не только editingFinished), чтобы чекбокс сразу
+            # активировался при непустом пути
+            path_edit.textChanged.connect(
+                lambda _t, idx=i: self._update_row(idx))
             browse_btn = QPushButton("...")
             browse_btn.setObjectName("browse_fw_btn")
             browse_btn.setToolTip("Выбрать файл прошивки")
@@ -1927,6 +2056,42 @@ class EditSPDialog(QDialog):
                 if found_fw:
                     found_fw['filename'] = filename
                     found_fw['source'] = detect_fw_source(path)
+                    # v1.71: для файлов вне скана firmware_dir (например,
+                    # выбранных через «Обзор») fmt_ok не задан — вычисляем
+                    # полный контроль формата по имени сразу, чтобы
+                    # «Выбрать все» и загрузка корректно учитывали опцию
+                    # «Контроль формата прошивок».
+                    _f, _ok, _sup, _w = fw_name_format(filename, parsed=found_fw)
+                    found_fw['fmt_ok'] = bool(_sup)
+                else:
+                    # Имя с корректным префиксом, но не проходит строгий
+                    # шаблон (например appl_atb3500_dir12_r.bin из плана без
+                    # версии/даты) — формируем минимальную запись, иначе
+                    # путь остался бы без local_fw и модуль нельзя было бы
+                    # выбрать даже при отключённом контроле формата.
+                    prefix_fmt, pfx_ok, sup, _warn = fw_name_format(filename)
+                    if pfx_ok:
+                        parts = os.path.splitext(filename)[0].split("_")
+                        mt = parts[2].upper() if len(parts) > 2 else "N/A"
+                        if mt == "PSU":
+                            mt = "POWER_UNIT"
+                        found_fw = {
+                            "module_type": mt,
+                            "version": "N/A",
+                            "date": "N/A",
+                            "fw_type": "boot" if prefix_fmt == "boot" else "apply",
+                            "name_prefix": prefix_fmt,
+                            "marker": parts[1].upper() if len(parts) > 1 else "N/A",
+                            "manufacturer": parts[1].upper() if len(parts) > 1 else "N/A",
+                            "filename": filename,
+                            "local_path": "",
+                            "rel_path": re.sub(r'^images/', '', path.replace('\\', '/')),
+                            "fmt_ok": bool(sup),
+                        }
+                        # источник: по пути (подпапка full/apply/boot), иначе
+                        # из префикса имени ('appl' -> внутренний 'apply')
+                        found_fw["source"] = detect_fw_source(path) or \
+                            ("apply" if prefix_fmt == "appl" else prefix_fmt)
         row['local_fw'] = found_fw
         row['source'] = (found_fw.get('source') if found_fw else None) \
             or detect_fw_source(path)
@@ -2012,8 +2177,8 @@ class EditSPDialog(QDialog):
         cb = self.checkboxes[idx]
         path_empty = not self.path_edits[idx].text().strip()
         if row.get("flashable", True):
-            wants_checked = (not path_empty) and bool(fw) and self._format_ok(
-                self.path_edits[idx].text().strip())
+            wants_checked = self._is_selectable(idx)
+            # v1.71: пустой путь — выбор снят и чекбокс неактивен
             cb.setEnabled(not path_empty)
             if cb.isChecked() != wants_checked:
                 cb.blockSignals(True)
@@ -2043,12 +2208,9 @@ class EditSPDialog(QDialog):
         if not checked:
             bg_color = "#e0e0e0"
         elif versions_match:
+            # Совпадение версий — только подсветка (перепрошивка той же
+            # версией разрешена, выбор не снимается — требование v1.71)
             bg_color = "#c8e6c9"
-            if self.checkboxes[idx].isChecked():
-                self.checkboxes[idx].blockSignals(True)
-                self.checkboxes[idx].setChecked(False)
-                self.checkboxes[idx].blockSignals(False)
-                bg_color = "#e0e0e0"
 
         for col in range(self.COL_COUNT):
             item = self.table.item(idx, col)
@@ -2172,34 +2334,49 @@ class EditSPDialog(QDialog):
         return True
 
     def fw_format_supported(self, path):
-        """supported-флаг формата файла (см. fw_name_format) с учётом
-        результата скана локальной директории прошивок."""
-        row = None
-        for i in range(len(self.rows)):
-            if self.path_edits[i].text().strip() == path:
-                row = self.rows[i]
+        """supported-флаг строгого контроля формата имени файла прошивки.
+
+        v1.71: контроль касается НЕ только full — файл считается
+        некорректным, если парсер не может обнаружить в имени версию, тип
+        модуля или тип прошивки (например 'appl_atb3500_ai8_r.bin'). При
+        включённом контроле формата такие файлы не загружаются на устройство
+        и не прошиваются; при отключённом — только предупреждения.
+        """
+        fw = None
+        for row in self.rows:
+            cand = row.get('local_fw')
+            if cand and (cand.get('rel_path') == re.sub(r'^images/', '', path)
+                        or cand.get('filename') == os.path.basename(path)):
+                fw = cand
                 break
-        fw = (row or {}).get('local_fw')
         filename = os.path.basename((fw or {}).get('filename') or path)
-        _, _, supported, _warning = fw_name_format(filename)
+        _, _, supported, _warning = fw_name_format(filename, parsed=fw)
         return supported
 
     def select_all(self):
-        """Выбирает только строки, удовлетворяющие условиям прошивки:
-        модуль доступен (есть SN, не резерв широкого модуля) и заполнен путь
-        к файлу прошивки; при совпадении версий выбор тоже снимается."""
+        """Выбирает все модули, для которых разрешена прошивка.
+
+        Условия (v1.71): модуль доступен (есть SN, не резерв широкого
+        модуля), путь к файлу прошивки непустой, файл прошёл контроль
+        формата (при включённой опции); совпадение версии прошивки с версией
+        на устройстве выбор НЕ снимает (модуль можно перепрошить той же
+        версией)."""
         for i, cb in enumerate(self.checkboxes):
-            if self._is_selectable(i):
-                cb.setChecked(True)
-            else:
-                cb.blockSignals(True)
-                cb.setChecked(False)
-                cb.blockSignals(False)
+            ok = self._is_selectable(i)
+            cb.blockSignals(True)
+            if self.rows[i].get("flashable", True):
+                # чекбокс прошиваемого модуля всегда активен; для строк с
+                # пустым путём/некорректным форматом выбор просто снят
+                cb.setEnabled(True)
+            cb.setChecked(bool(ok))
+            cb.blockSignals(False)
             self._update_row(i)
 
     def deselect_all(self):
         for i, cb in enumerate(self.checkboxes):
+            cb.blockSignals(True)
             cb.setChecked(False)
+            cb.blockSignals(False)
             self._update_row(i)
 
     def _present_module_types(self):
@@ -2449,10 +2626,8 @@ class MainWindow(QMainWindow):
         self.plan_btn.setObjectName("browse_btn")
         self.plan_btn.clicked.connect(lambda: self.browse_file(self.plan_edit))
         conn_layout.addWidget(self.plan_btn, 3, 3)
-        conn_layout.addWidget(QLabel("API путь:"), 4, 0)
-        self.api_path_edit = QLineEdit()
-        self.api_path_edit.setPlaceholderText("/vx3/backend.fcgi")
-        conn_layout.addWidget(self.api_path_edit, 4, 1, 1, 2)
+        # v1.71: поле ввода «API путь» убрано — путь фиксирован
+        # (/vx3/backend.fcgi, см. BackendClient.API_PATH).
         # Опция «Контроль формата прошивок» (по умолчанию включена):
         # при включённой прошивки, не прошедшие контроль формата имени,
         # на устройство не загружаются и модули ими не прошиваются;
@@ -2467,17 +2642,7 @@ class MainWindow(QMainWindow):
             "на устройство не загружаются и прошивка ими запрещена.\n"
             "При отключении ограничения снимаются: выводятся только\n"
             "предупреждения, загрузка и прошивка выполняются.")
-        conn_layout.addWidget(self.format_control_cb, 5, 0, 1, 4)
-        # v1.70: режим операционного лога. По умолчанию — краткий (без
-        # детализации: сводные итоги вместо пер-слотовых отладочных строк).
-        self.verbose_log_cb = QCheckBox(
-            "Подробный операционный лог (с детализацией)")
-        self.verbose_log_cb.setToolTip(
-            "По умолчанию выключена: в журнале только ключевые события,\n"
-            "итоговые сводки, предупреждения и ошибки.\n"
-            "Включите для отладки: добавятся пер-слотовые строки парсера,\n"
-            "списки файлов с проблемами формата и прочая детализация.")
-        conn_layout.addWidget(self.verbose_log_cb, 6, 0, 1, 4)
+        conn_layout.addWidget(self.format_control_cb, 4, 0, 1, 4)
         conn_group.setLayout(conn_layout)
         main_layout.addWidget(conn_group)
 
@@ -2524,6 +2689,19 @@ class MainWindow(QMainWindow):
         dev_label.setStyleSheet("color: #333333; font-style: italic; font-size: 12px; font-weight: bold;")
         bottom_layout.addWidget(dev_label)
         bottom_layout.addStretch()
+        # v1.71: чекбокс «Детализация» — слева от кнопки «Очистить лог».
+        # По умолчанию выключен: в журнале только ключевые события, сводки,
+        # предупреждения и ошибки. При включении показываются имена всех
+        # загружаемых/игнорируемых прошивок, HTTP-детализация (Payload,
+        # заголовки/тело ответа, статусы), MakePlan stdout и т.п.
+        self.verbose_log_cb = QCheckBox("Детализация")
+        self.verbose_log_cb.setToolTip(
+            "По умолчанию выключена: в журнале только ключевые события,\n"
+            "итоговые сводки, предупреждения и ошибки.\n"
+            "Включите для отладки: добавятся имена всех загружаемых и\n"
+            "игнорируемых прошивок, HTTP-детализация (Payload, заголовки\n"
+            "и тело ответа, статусы), MakePlan stdout, пер-слотовые строки.")
+        bottom_layout.addWidget(self.verbose_log_cb)
         self.clear_log_btn = QPushButton("Очистить лог")
         self.clear_log_btn.setObjectName("clear_btn")
         self.clear_log_btn.clicked.connect(self.log_text.clear)
@@ -2576,7 +2754,6 @@ class MainWindow(QMainWindow):
             "agent_dir": self.agent_edit.text(),
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
-            "api_path": self.api_path_edit.text(),
             "format_control": self.format_control_cb.isChecked(),
             "verbose_log": self.verbose_log_cb.isChecked()
         }
@@ -2589,7 +2766,6 @@ class MainWindow(QMainWindow):
         self.agent_edit.setText(self.config.get("agent_dir", ""))
         self.fw_edit.setText(self.config.get("firmware_dir", ""))
         self.plan_edit.setText(self.config.get("plan_xml", ""))
-        self.api_path_edit.setText(self.config.get("api_path", "/vx3/backend.fcgi"))
         self.format_control_cb.setChecked(bool(self.config.get("format_control", True)))
         self.verbose_log_cb.setChecked(bool(self.config.get("verbose_log", False)))
 
@@ -2621,7 +2797,6 @@ class MainWindow(QMainWindow):
             "agent_dir": self.agent_edit.text(),
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
-            "api_path": self.api_path_edit.text(),
             "format_control": self.format_control_cb.isChecked(),
             "verbose_log": self.verbose_log_cb.isChecked()
         }
