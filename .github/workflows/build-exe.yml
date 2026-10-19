@@ -72,35 +72,12 @@ jobs:
           path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
 
-      - name: Установка GitHub CLI (для загрузки ассетов официальным способом)
+      - name: Публикация релиза и загрузка .exe (официальный gh + ретраи)
         if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Ставим официальный gh из релизов cli/cli (пакеты winget/choco в image
-          # могут быть устаревшими и не поддерживать --repo). Скачиваем zip под
-          # Windows, unzip через PowerShell.
-          GHV=2.40.1
-          # Пути в bash на Windows — вида C:/... (через pwd -W), чтобы их понимал
-          # PowerShell (он не знает про /tmp из MSYS).
-          ZIP=$(pwd -W)/gh_cli.zip
-          DEST=$(pwd -W)/gh_cli
-          rm -rf gh_cli; curl -sSL -o gh_cli.zip \
-            "https://github.com/cli/cli/releases/download/v${GHV}/gh_${GHV}_windows_amd64.zip"
-          ZIP=$(echo "$ZIP" | tr '\\' '/')
-          DEST=$(echo "$DEST" | tr '\\' '/')
-          powershell -NoProfile -Command \
-            "Expand-Archive -Path '$ZIP' -DestinationPath '$DEST' -Force"
-          GHDIR=$(find gh_cli -type f -name gh.exe | head -1 | xargs dirname)
-          echo "$GHDIR" >> "$GITHUB_PATH"
-          "$GHDIR/gh.exe" --version
-
-      - name: Создание релиза и загрузка .exe через REST API (при пуше тега)
-        if: startsWith(github.ref, 'refs/tags/v')
-        # Примечание: ранее использовался softprops/action-gh-release@v2, но он
-        # создавал «битые» ассеты (ссылка на скачивание отдавала 404 — файлы не
-        # догружались до CDN). Прямая загрузка через uploads.github.com даёт
-        # рабочий ассет; шаг проверяет размер загруженного файла.
+        # История проблемы: ассеты создавались, но browser_download_url отдавал
+        # 404 (файл не догружался до хранилища GitHub). Решение: официальный
+        # GitHub CLI (gh release upload) с ретраями и принудительной проверкой
+        # доступности; при неудаче — запасной путь через REST uploads.github.com.
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -108,90 +85,54 @@ jobs:
           REPO: ${{ github.repository }}
           EXE: ${{ steps.ver.outputs.exe }}
         run: |
-          set -euo pipefail
-          # --- Основной путь: официальный GitHub CLI (gh release create/upload).
-          # gh корректно догружает ассеты и проверяет результат; при успехе
-          # завершаем шаг, REST остаётся запасным путём ниже.
+          set -uo pipefail
           BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
-          if command -v gh >/dev/null 2>&1; then
-            if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-              gh release create "$TAG" --repo "$REPO" \
-                --title "MFC_Flasher $TAG" --notes "$BODY" \
-                "dist/${{ steps.ver.outputs.exe }}#MFC_Flasher Windows x64"
-            else
-              gh release upload "$TAG" "dist/${{ steps.ver.outputs.exe }}" \
-                --repo "$REPO" --clobber
-            fi
-            URL=$(gh release view "$TAG" --repo "$REPO" \
-                  --json assets --jq ".assets[] | select(.name==\"${{ steps.ver.outputs.exe }}\") | .url")
-            echo "Ассет загружен через gh: $URL"
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
-            echo "Проверка доступности: HTTP $CODE"
-            if [ "$CODE" = "206" ] || [ "$CODE" = "200" ]; then
-              echo "### Скачать: [${{ steps.ver.outputs.exe }}]($URL)" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::warning::gh загрузил ассет, но проверка доступности не пройдена (HTTP $CODE) — пробуем REST"
-          else
-            echo "::warning::gh недоступен — используем REST API"
+          URL="https://github.com/$REPO/releases/download/$TAG/$EXE"
+          check() { local c; c=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL"); [ "$c" = "206" ] || [ "$c" = "200" ]; }
+          # 1) Релиз по тегу (создать, если нет)
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "MFC_Flasher $TAG" --notes "$BODY" || true
           fi
-          # --- Запасной путь: прямой REST uploads.github.com
-          API="https://api.github.com/repos/$REPO/releases"
-          UP="https://uploads.github.com/repos/$REPO/releases"
-          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          # Надёжное получение id релиза по тегу: парсим tag_name+url (поле 'id' может
-          # отсутствовать в кэшированном/неполном ответе API — тогда берём id из url).
-          get_rel_id() {
-            curl -s "${AUTH[@]}" "$API/tags/$TAG" \
-              | python -c "
-          import json,sys,re
-          try: d=json.load(sys.stdin)
-          except Exception: sys.exit(0)
-          if d.get('tag_name') != '$TAG': sys.exit(0)
-          rid=d.get('id')
-          if not rid:
-              m=re.search(r'/releases/(\\d+)', d.get('url','') or '')
-              rid=m.group(1) if m else ''
-          print(rid)
-          " 2>/dev/null || true
-          }
-          # 1) Ищем существующий релиз по тегу; если нет — создаём и ждём видимости
-          RELEASE_ID=$(get_rel_id)
-          if [ -z "$RELEASE_ID" ]; then
-            curl -s -o /tmp/rel.json -w "" -X POST "${AUTH[@]}" "$API" \
-              -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}" || true
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              sleep 3
-              RELEASE_ID=$(get_rel_id)
-              [ -n "$RELEASE_ID" ] && break
-              echo "Ожидаем видимости созданного релиза $TAG (попытка $i)"
+          # 2) Загрузка ассета официальным gh с ретраями (до 5 попыток)
+          for i in 1 2 3 4 5; do
+            echo "== Попытка $i: gh release upload =="
+            gh release upload "$TAG" "dist/$EXE" --repo "$REPO" --clobber || true
+            for s in 1 2 3 4 5 6; do
+              sleep 10
+              if check; then
+                echo "Ассет доступен: $URL"
+                echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
             done
-          fi
-          if [ -z "$RELEASE_ID" ]; then echo "::error::Не удалось получить релиз для тега $TAG"; exit 1; fi
-          echo "RELEASE_ID=$RELEASE_ID"
-          # 2) Если ассет с таким именем уже есть (например, битый) — удаляем
-          ASSET_ID=$(curl -s "${AUTH[@]}" "$API/$RELEASE_ID/assets" \
-            | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
-          if [ -n "$ASSET_ID" ]; then
-            curl -sf -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" || true
-          fi
-          # 3) Загрузка exe на uploads.github.com (Content-Length обязателен)
-          SIZE=$(stat -c%s "dist/$EXE" 2>/dev/null || wc -c < "dist/$EXE")
-          curl -sf -X POST \
+            echo "Ассет ещё не доступен (догрузка/кэш CDN)..."
+          done
+          # 3) Запасной путь: прямой REST uploads.github.com
+          echo "== Все попытки gh исчерпаны — пробую REST =="
+          API="https://api.github.com/repos/$REPO/releases"
+          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          RID=$(curl -s "${AUTH[@]}" "$API/tags/$TAG" | python -c "import json,sys,re; d=json.load(sys.stdin); rid=d.get('id'); print(rid if rid else (re.search(r'/releases/(\\d+)', d.get('url','')).group(1) if d.get('url') and re.search(r'/releases/(\\d+)', d.get('url','')) else ''))" 2>/dev/null || true)
+          [ -z "$RID" ] && { echo "::error::Нет релиза для $TAG"; exit 1; }
+          AID=$(curl -s "${AUTH[@]}" "$API/$RID/assets" | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
+          if [ -n "$AID" ]; then curl -s -X DELETE "${AUTH[@]}" "https://api.github.com/repos/$REPO/releases/assets/$AID" >/dev/null || true; fi
+          SIZE=$(wc -c < "dist/$EXE")
+          HTTP=$(curl -s -o rest_asset.json -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             -H "Content-Length: $SIZE" \
             --data-binary "@dist/$EXE" \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$EXE" > /tmp/asset.json
-          UPLOADED=$(python -c "import json; print(json.load(open('/tmp/asset.json'))['size'])")
-          echo "Загружено байт: $UPLOADED (ожидалось $SIZE)"
-          if [ "$UPLOADED" != "$SIZE" ]; then echo "::error::Размер ассета не совпадает"; exit 1; fi
-          URL=$(python -c "import json; print(json.load(open('/tmp/asset.json'))['browser_download_url'])")
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
-          echo "Проверка доступности: HTTP $CODE для $URL"
-          if [ "$CODE" != "206" ] && [ "$CODE" != "200" ]; then echo "::error::Ассет недоступен для скачивания"; exit 1; fi
-          echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
+            "$API/$RID/assets?name=$EXE")
+          echo "REST загрузка: HTTP $HTTP"
+          [ "$HTTP" = "201" ] || exit 1
+          for s in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            sleep 10
+            if check; then
+              echo "Ассет доступен (REST): $URL"
+              echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "::error::Ассет так и не стал доступен по $URL"; exit 1
 
       - name: Артефакт и для сборки по тегу (резервная копия exe)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -200,56 +141,3 @@ jobs:
           name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
           path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
-
-      - name: Запасной релиз через REST API (если основной шаг не смог)
-        if: failure() && startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          API="https://api.github.com/repos/$REPO/releases"
-          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          get_rel_id() {
-            curl -s "${AUTH[@]}" "$API/tags/$TAG" \
-              | python -c "
-          import json,sys,re
-          try: d=json.load(sys.stdin)
-          except Exception: sys.exit(0)
-          if d.get('tag_name') != '$TAG': sys.exit(0)
-          rid=d.get('id')
-          if not rid:
-              m=re.search(r'/releases/(\\d+)', d.get('url','') or '')
-              rid=m.group(1) if m else ''
-          print(rid)
-          " 2>/dev/null || true
-          }
-          EXE="MFC_Flasher_v${{ steps.ver.outputs.version }}.exe"
-          RELEASE_ID=$(get_rel_id)
-          if [ -z "$RELEASE_ID" ]; then
-            curl -s -X POST "${AUTH[@]}" "$API" \
-              -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"Сборка exe от GitHub Actions (резервный путь).\",\"draft\":false,\"prerelease\":false}" >/dev/null || true
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              sleep 3
-              RELEASE_ID=$(get_rel_id)
-              [ -n "$RELEASE_ID" ] && break
-            done
-          fi
-          if [ -z "$RELEASE_ID" ]; then echo "::error::Нет релиза для $TAG"; exit 1; fi
-          ASSET_ID=$(curl -s "${AUTH[@]}" "$API/$RELEASE_ID/assets" | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
-          if [ -n "$ASSET_ID" ]; then curl -s -X DELETE "${AUTH[@]}" "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" >/dev/null || true; fi
-          SIZE=$(wc -c < "dist/$EXE")
-          HTTP=$(curl -s -o ./asset_upload.json -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            -H "Content-Length: $SIZE" \
-            --data-binary "@dist/$EXE" \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$EXE")
-          echo "Загрузка ассета: HTTP $HTTP"
-          if [ "$HTTP" != "201" ]; then exit 1; fi
-          URL=$(python -c "import json; print(json.load(open('./asset_upload.json'))['browser_download_url'])")
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
-          echo "Проверка доступности: HTTP $CODE для $URL"
-          [ "$CODE" = "206" ] || [ "$CODE" = "200" ] || exit 1
