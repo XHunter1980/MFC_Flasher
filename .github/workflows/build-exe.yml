@@ -93,9 +93,17 @@ jobs:
             "https://api.github.com/repos/$REPO/releases" \
             -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}")
           if [ "$HTTP" != "201" ]; then echo "Релиз уже существует (HTTP $HTTP), использую его"; fi
-          RELEASE_ID=$(curl -s -f -L --retry 5 --retry-delay 3 -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
-            | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          # Релиз мог ещё не видимость из-за задержки репликации — ждём и повторяем запрос
+          RELEASE_ID=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 5
+            RELEASE_ID=$(curl -s -L -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+              | python -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+            [ -n "$RELEASE_ID" ] && break
+            echo "Релиз по тегу $TAG ещё не найден (попытка $i)"
+          done
+          if [ -z "$RELEASE_ID" ]; then echo "::error::Не удалось получить релиз для тега $TAG"; exit 1; fi
           # 2) Если ассет с таким именем уже есть (например, битый) — удаляем
           ASSET_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/$REPO/releases/$RELEASE_ID/assets" \
@@ -145,9 +153,17 @@ jobs:
             "https://api.github.com/repos/$REPO/releases" \
             -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md.\",\"draft\":false,\"prerelease\":false}" \
             || echo "Релиз, возможно, уже существует"
-          RELEASE_ID=$(curl -s -f -L --retry 5 --retry-delay 3 -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
-            | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          # Релиз мог ещё не видимость из-за задержки репликации — ждём и повторяем запрос
+          RELEASE_ID=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 5
+            RELEASE_ID=$(curl -s -L -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+              | python -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+            [ -n "$RELEASE_ID" ] && break
+            echo "Релиз по тегу $TAG ещё не найден (попытка $i)"
+          done
+          if [ -z "$RELEASE_ID" ]; then echo "::error::Не удалось получить релиз для тега $TAG"; exit 1; fi
           curl -sf -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/octet-stream" \
