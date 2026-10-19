@@ -72,6 +72,23 @@ jobs:
           path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
 
+      - name: Установка GitHub CLI (для загрузки ассетов официальным способом)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ставим официальный gh из релизов cli/cli (пакеты winget/choco в image
+          # могут быть устаревшими и не поддерживать --repo). Скачиваем zip под
+          # Windows, unzip через PowerShell.
+          GHV=2.40.1
+          curl -sSL -o /tmp/gh.zip \
+            "https://github.com/cli/cli/releases/download/v${GHV}/gh_${GHV}_windows_amd64.zip"
+          powershell -NoProfile -Command \
+            "Expand-Archive -Path /tmp/gh.zip -DestinationPath /tmp/gh -Force"
+          GHDIR=$(find /tmp/gh -type f -name gh.exe | head -1 | xargs dirname)
+          echo "$GHDIR" >> "$GITHUB_PATH"
+          gh --version
+
       - name: Создание релиза и загрузка .exe через REST API (при пуше тега)
         if: startsWith(github.ref, 'refs/tags/v')
         # Примечание: ранее использовался softprops/action-gh-release@v2, но он
@@ -86,7 +103,33 @@ jobs:
           EXE: ${{ steps.ver.outputs.exe }}
         run: |
           set -euo pipefail
+          # --- Основной путь: официальный GitHub CLI (gh release create/upload).
+          # gh корректно догружает ассеты и проверяет результат; при успехе
+          # завершаем шаг, REST остаётся запасным путём ниже.
           BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
+          if command -v gh >/dev/null 2>&1; then
+            if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              gh release create "$TAG" --repo "$REPO" \
+                --title "MFC_Flasher $TAG" --notes "$BODY" \
+                "dist/${{ steps.ver.outputs.exe }}#MFC_Flasher Windows x64"
+            else
+              gh release upload "$TAG" "dist/${{ steps.ver.outputs.exe }}" \
+                --repo "$REPO" --clobber
+            fi
+            URL=$(gh release view "$TAG" --repo "$REPO" \
+                  --json assets --jq ".assets[] | select(.name==\"${{ steps.ver.outputs.exe }}\") | .url")
+            echo "Ассет загружен через gh: $URL"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
+            echo "Проверка доступности: HTTP $CODE"
+            if [ "$CODE" = "206" ] || [ "$CODE" = "200" ]; then
+              echo "### Скачать: [${{ steps.ver.outputs.exe }}]($URL)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::warning::gh загрузил ассет, но проверка доступности не пройдена (HTTP $CODE) — пробуем REST"
+          else
+            echo "::warning::gh недоступен — используем REST API"
+          fi
+          # --- Запасной путь: прямой REST uploads.github.com
           API="https://api.github.com/repos/$REPO/releases"
           UP="https://uploads.github.com/repos/$REPO/releases"
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
