@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.71"
+APP_VERSION = "1.72"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -654,34 +654,85 @@ def fw_name_format(filename, parsed=None):
         return (fmt, True, False,
                 f"Файл '{filename}' имеет некорректное имя: "
                 + ", ".join(problems) +
-                " (ожидаются сегменты R<маж>_<мин>_<ДДММГГ>)")
+                " (ожидаются сегменты R<маж>.<мин> или R<маж>_<мин> "
+                "и дата ДДММГГ)")
     return (fmt, True, True, None)
+
+
+# Строгий шаблон полного имени прошивки (v1.72). Сегменты:
+#   <appl|boot|full>_<маркер>_<тип>[_...]_R<маж>[._]<мин>_<ДДММГГ>[_...]
+# Версия допускает три записи: R3_4 (старый формат), R3.4 (новая,
+# точка внутри сегмента) и R34 (мажор+минор слитно, минор 1-2 цифры).
+_FW_STRICT_RE = re.compile(
+    r"^(?P<prefix>appl|boot|full)"
+    r"_(?P<marker>[a-z0-9]+)"
+    r"_(?P<mtype>[a-z0-9]+)"
+    r"(?:_[a-z0-9]+)*?"
+    r"_R(?P<major>\d+)[._](?P<minor>\d{1,2})"
+    r"_(?P<date>\d{6})(?:_.*)?$",
+    re.IGNORECASE,
+)
+
+
+def _try_parse_fw_name(name_no_ext):
+    """Разбор строгого шаблона полного имени прошивки.
+
+    Возвращает dict с ключами prefix/marker/mtype/major/minor/date или
+    None, если имя не соответствует шаблону.
+    """
+    m = _FW_STRICT_RE.match(name_no_ext)
+    if not m:
+        return None
+    date_ = m.group("date")
+    day, month = int(date_[0:2]), int(date_[2:4])
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    return {"prefix": m.group("prefix").lower(),
+            "marker": m.group("marker"),
+            "mtype": m.group("mtype"),
+            "major": m.group("major"), "minor": m.group("minor"),
+            "date": date_}
 
 
 def parse_firmware_filename(filename):
     """Парсинг имени файла прошивки согласно правилам из Excel.
 
-    Поддерживаются два формата: старый 'full_<...>' (7 частей) и новый
-    '<appl|boot>_<маркер>_<тип>_<произв>_R<вер>_<дата>_<...>' — в этом
-    случае префикс имени возвращается в поле 'name_prefix'.
+    Поддерживаемые форматы версии (v1.72): R3_4, R3.4 и R34 — версия
+    нормализуется к виду 'R 3.4'; дата — 6 цифр ДДММГГ (191026 →
+    10/19/26). Разрешены имена как со старыми 7 сегментами
+    ('full_<маркер>_<тип>_..._R<маж>_<мин>_<дата>'), так и с версией в
+    одном сегменте ('appl_atb3500_ai8_R3.4_191026.bin').
     """
     name_no_ext = os.path.splitext(filename)[0]
     parts = name_no_ext.split('_')
 
-    if len(parts) < 7:
+    if len(parts) < 5:
         return None
     if parts[0] not in ('full', 'appl', 'boot'):
         return None
 
-    name_prefix = parts[0]
-    marker_raw = parts[1]
-    type_raw = parts[2]
-    ver_major_raw = parts[4]
-    ver_minor = parts[5]
-    date_raw = parts[6]
+    # v1.72: сначала пробуем строгий шаблон (покрывает R3.4/R34 внутри
+    # одного сегмента); при неудаче — старый позиционный разбор.
+    strict = _try_parse_fw_name(name_no_ext)
 
-    if not ver_major_raw.upper().startswith('R'):
-        return None
+    if strict:
+        name_prefix = strict["prefix"]
+        marker_raw = strict["marker"]
+        type_raw = strict["mtype"]
+        ver_major_raw = "R" + strict["major"]
+        ver_minor = strict["minor"]
+        date_raw = strict["date"]
+    else:
+        if len(parts) < 7:
+            return None
+        name_prefix = parts[0]
+        marker_raw = parts[1]
+        type_raw = parts[2]
+        ver_major_raw = parts[4]
+        ver_minor = parts[5]
+        date_raw = parts[6]
+        if not ver_major_raw.upper().startswith('R'):
+            return None
 
     marker = marker_raw.upper()
     if marker.startswith('ATB'):
@@ -1299,8 +1350,16 @@ class OperationWorker(QThread):
                     module_type = parts[2].upper() if len(parts) > 2 else "N/A"
                     if module_type == "PSU":
                         module_type = "POWER_UNIT"
+                    # v1.72: версия может быть в одном сегменте
+                    # (R3.4 / R34) или в двух (R3_4), дата — ДДММГГ.
                     ver = "N/A"
                     for p_ in parts[3:]:
+                        mv = re.match(r"^R(\d+)[._](\d{1,2})$", p_, re.I)
+                        if not mv:
+                            mv = re.match(r"^R(\d+)(\d{1,2})$", p_, re.I)
+                        if mv:
+                            ver = f"R {mv.group(1)}.{mv.group(2)}"
+                            break
                         if re.match(r"^R\d+$", p_, re.I):
                             idx = parts.index(p_)
                             if idx + 1 < len(parts) and parts[idx + 1].isdigit():
