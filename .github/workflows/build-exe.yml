@@ -81,13 +81,19 @@ jobs:
           # могут быть устаревшими и не поддерживать --repo). Скачиваем zip под
           # Windows, unzip через PowerShell.
           GHV=2.40.1
-          curl -sSL -o /tmp/gh.zip \
+          # Пути в bash на Windows — вида C:/... (через pwd -W), чтобы их понимал
+          # PowerShell (он не знает про /tmp из MSYS).
+          ZIP=$(pwd -W)/gh_cli.zip
+          DEST=$(pwd -W)/gh_cli
+          rm -rf gh_cli; curl -sSL -o gh_cli.zip \
             "https://github.com/cli/cli/releases/download/v${GHV}/gh_${GHV}_windows_amd64.zip"
+          ZIP=$(echo "$ZIP" | tr '\\' '/')
+          DEST=$(echo "$DEST" | tr '\\' '/')
           powershell -NoProfile -Command \
-            "Expand-Archive -Path /tmp/gh.zip -DestinationPath /tmp/gh -Force"
-          GHDIR=$(find /tmp/gh -type f -name gh.exe | head -1 | xargs dirname)
+            "Expand-Archive -Path '$ZIP' -DestinationPath '$DEST' -Force"
+          GHDIR=$(find gh_cli -type f -name gh.exe | head -1 | xargs dirname)
           echo "$GHDIR" >> "$GITHUB_PATH"
-          gh --version
+          "$GHDIR/gh.exe" --version
 
       - name: Создание релиза и загрузка .exe через REST API (при пуше тега)
         if: startsWith(github.ref, 'refs/tags/v')
