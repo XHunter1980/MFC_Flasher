@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.73"
+APP_VERSION = "1.74"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -3344,9 +3344,32 @@ def _install_excepthook(window_ref):
     sys.excepthook = hook
 
 
+def _install_app_icon(app):
+    """Устанавливает иконку приложения (окно + панель задач).
+
+    Ищет MFC_moduleUpd.ico рядом со скриптом; в собранном PyInstaller exe —
+    во временной директории бандла (_MEIPASS, файл добавляется через --add-data).
+    Отсутствие иконки не является ошибкой.
+    """
+    import os
+
+    from PyQt6.QtGui import QIcon
+    candidates = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "MFC_moduleUpd.ico")]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "MFC_moduleUpd.ico"))
+    for path in candidates:
+        if os.path.isfile(path):
+            app.setWindowIcon(QIcon(path))
+            return True
+    return False
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    _install_app_icon(app)
     window = MainWindow()
     _win_ref = [window]
     _install_excepthook(_win_ref)

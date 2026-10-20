@@ -44,7 +44,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
 
       - name: Определение версии приложения
         id: ver
@@ -59,11 +59,44 @@ jobs:
           echo "exe=MFC_Flasher_v$VER.exe" >> "$GITHUB_OUTPUT"
           echo "Собираем $SRC -> MFC_Flasher_v$VER.exe"
 
-      - name: Сборка exe (onefile, без консоли, версия в имени)
+      - name: Иконка приложения (сжатие ICO если нужно)
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed \
+          # Иконка берётся из корня репозитория (файл MFC_moduleUpd.ico).
+          # PyInstaller принимает только квадратные и корректно объявленные
+          # изображения; нестандартный ico сжимается через Pillow в набор
+          # стандартных размеров. Если Pillow недоступен — используем как есть.
+          ICON=MFC_moduleUpd.ico
+          if [ ! -f "$ICON" ]; then
+            echo "::warning::Файл иконки $ICON не найден — сборка без иконки"
+            echo "icon=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python - <<'PY'
+          from PIL import Image
+          im = Image.open("MFC_moduleUpd.ico")
+          sizes = [(s, s) for s in (16, 32, 48, 64, 128, 256)]
+          im.convert("RGBA").resize((256, 256), Image.LANCZOS).save(
+              "app_icon.ico", sizes=sizes)
+          print("app_icon.ico создан (квадратный, 16..256)")
+          PY
+          if [ -f app_icon.ico ]; then
+            echo "icon=app_icon.ico" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=$ICON" >> "$GITHUB_OUTPUT"
+          fi
+        id: icon
+
+      - name: Сборка exe (onefile, без консоли, версия в имени, иконка)
+        shell: bash
+        run: |
+          ICON_FLAG=""
+          if [ -n "${{ steps.icon.outputs.icon }}" ]; then
+            ICON_FLAG="--icon \"${{ steps.icon.outputs.icon }}\" --add-data \"${{ steps.icon.outputs.icon }};.\""
+          fi
+          eval pyinstaller --noconfirm --clean --onefile --windowed \
             --name "MFC_Flasher_v${{ steps.ver.outputs.version }}" \
+            $ICON_FLAG \
             "${{ steps.ver.outputs.src }}"
 
       - name: Проверка результата сборки
