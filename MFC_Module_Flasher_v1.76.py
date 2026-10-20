@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.75"
+APP_VERSION = "1.76"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -114,6 +114,14 @@ QPushButton#col2_btn_4 { background-color: #8e8cd8; }
 QPushButton#col2_btn_4:hover { background-color: #6e6cbf; }
 QPushButton#col2_btn_9 { background-color: #6b6956; }
 QPushButton#col2_btn_9:hover { background-color: #504e3f; }
+/* v1.76: «Удалить агента» и «Автопрошивка» — стиль как у остальных кнопок
+   (раньше не имели фона в таблице стилей: белый текст на белом). */
+QPushButton#col1_btn_12 { background-color: #b54708; }
+QPushButton#col1_btn_12:hover { background-color: #8a3606; }
+QPushButton#col2_btn_13 { background-color: #107c10; }
+QPushButton#col2_btn_13:hover { background-color: #0b5e0b; }
+QPushButton#dialog_btn_dump { background-color: #008272; color: white; padding: 6px 20px; }
+QPushButton#dialog_btn_dump:hover { background-color: #005f53; }
 QPushButton#clear_btn { background-color: #6c757d; }
 QPushButton#clear_btn:hover { background-color: #5a6268; }
 QPushButton#dialog_btn_ok { background-color: #0078d7; color: white; padding: 6px 20px; }
@@ -626,9 +634,16 @@ def fw_name_format(filename, parsed=None):
                 f"Файл '{filename}' имеет формат full — "
                 "такой формат пока не поддерживается")
 
-    # Полный контроль состава имени (v1.71): тип модуля, версия, тип прошивки
+    # Полный контроль состава имени (v1.71, доработка v1.76).
     if parsed is None:
         parsed = parse_firmware_filename(os.path.basename(filename or ''))
+    # v1.76: короткие имена без версии/даты ('appl_atb3500_dir12_r.bin')
+    # считаются корректными — тип модуля и тип прошивки определяются из
+    # имени; версия/дата в таких именах отсутствуют по формату.
+    if parsed is None:
+        short = _try_parse_short_fw_name(os.path.basename(filename or ''))
+        if short is not None and short.get('module_type'):
+            return (fmt, True, True, None)
     # Результат строгого контроля из скана firmware_dir (fmt_ok) имеет приоритет:
     # скан уже разобрал имя и заполнил поля минимально.
     if isinstance(parsed, dict) and 'fmt_ok' in parsed:
@@ -668,8 +683,22 @@ _FW_STRICT_RE = re.compile(
     r"_(?P<marker>[a-z0-9]+)"
     r"_(?P<mtype>[a-z0-9]+)"
     r"(?:_[a-z0-9]+)*?"
-    r"_R(?P<major>\d+)[._](?P<minor>\d{1,2})"
+    r"(?:_R(?P<major>\d{1,3})[._](?P<minor>\d{1,2})"
+    r"|_r(?P<rminor>\d{1,2}))"
     r"_(?P<date>\d{6})(?:_.*)?$",
+    re.IGNORECASE,
+)
+
+# v1.76: «короткие» имена прошивок без версии/даты — например
+# 'appl_atb3500_dir12_r.bin' (такие файлы реально используются в СП,
+# которые генерирует MakePlan на контроллере). Сегменты:
+#   <appl|boot|full>_<маркер>_<тип>[_...][_r]
+_FW_SHORT_RE = re.compile(
+    r"^(?P<prefix>appl|boot|full)"
+    r"_(?P<marker>[a-z0-9]+)"
+    r"_(?P<mtype>[a-z0-9]+)"
+    r"(?:_[a-z0-9]+)*?"
+    r"(?:_r)?$",
     re.IGNORECASE,
 )
 
@@ -687,11 +716,46 @@ def _try_parse_fw_name(name_no_ext):
     day, month = int(date_[0:2]), int(date_[2:4])
     if not (1 <= day <= 31 and 1 <= month <= 12):
         return None
+    major = m.group("major")
+    minor = m.group("minor")
+    if major is None:
+        # v1.76: сокращённая запись версии '_r<мин>' без мажора —
+        # мажор по умолчанию 2 (исторические сборки МФК вида R2_x).
+        major = "2"
+        minor = m.group("rminor")
     return {"prefix": m.group("prefix").lower(),
             "marker": m.group("marker"),
             "mtype": m.group("mtype"),
-            "major": m.group("major"), "minor": m.group("minor"),
+            "major": major, "minor": minor,
             "date": date_}
+
+
+def _try_parse_short_fw_name(filename):
+    """v1.76: разбор короткого имени прошивки без версии/даты.
+
+    Примеры: 'appl_atb3500_dir12_r.bin', 'boot_atb3500_psu_r.bin'.
+    Тип модуля берётся из третьего сегмента ('psu' → POWER_UNIT);
+    поля version/date остаются пустыми (их нет в имени). Возвращает
+    dict совместимый с parse_firmware_filename или None.
+    """
+    name_no_ext = os.path.splitext(filename)[0]
+    m = _FW_SHORT_RE.match(name_no_ext)
+    if not m:
+        return None
+    marker = m.group("marker").upper()
+    if marker.startswith('ATB'):
+        marker = 'ATB ' + marker[3:]
+    module_type = m.group("mtype").upper()
+    if module_type == 'PSU':
+        module_type = 'POWER_UNIT'
+    prefix = m.group("prefix").lower()
+    fw_type = 'apply' if prefix == 'appl' else prefix
+    return {"filename": filename,
+            "fw_type": fw_type,
+            "marker": marker,
+            "module_type": module_type,
+            "version": "",
+            "date": ""}
 
 
 def parse_firmware_filename(filename):
@@ -731,8 +795,16 @@ def parse_firmware_filename(filename):
         ver_major_raw = parts[4]
         ver_minor = parts[5]
         date_raw = parts[6]
+        # v1.76: поддержка сокращённой записи версии '_r<мин>' без мажора
+        # (например 'appl_atb3500_dir12_r_191026.bin'): в позиционном
+        # разборе это parts[4]='r', parts[5]=минор; мажор по умолчанию 2.
         if not ver_major_raw.upper().startswith('R'):
-            return None
+            if (ver_major_raw.lower() == 'r' and ver_minor.isdigit()
+                    and len(ver_minor) <= 2):
+                ver_major_raw = 'R2'
+                ver_minor = parts[5]
+            else:
+                return None
 
     marker = marker_raw.upper()
     if marker.startswith('ATB'):
@@ -925,6 +997,59 @@ class OperationWorker(QThread):
     def _check_service_status(self, ssh, service_name):
         out, _ = ssh.exec_command(f"systemctl is-active {service_name}")
         return out.strip()
+
+    def _upload_rows_firmwares(self, ssh, rows):
+        """v1.76: проверка наличия и дозагрузка файлов прошивок на устройство
+        по строкам сценария (rows — из редактора/тихого режима).
+
+        Логика та же, что у _upload_selected_firmwares (для plan.xml), но
+        источник данных — сами строки СП, а не файл на диске. Используется
+        в цепочке Автопрошивки, где локального plan_xml может не быть или он
+        устарел."""
+        if not rows:
+            self.log("Сценарий прошивки пуст — проверка файлов пропускается")
+            return []
+        fw_by_rel = {}
+        for fw in self._scan_firmware_dir():
+            fw_by_rel[fw['rel_path']] = fw
+        uploaded = 0
+        present = 0
+        for mod in rows:
+            path = (mod.get('path') or '').replace('\\', '/')
+            rel = re.sub(r'^images/', '', path)
+            remote = f"/home/user/fw_update/images/{rel}"
+            if ssh.sftp_stat(remote):
+                present += 1
+                continue
+            fw = fw_by_rel.get(rel)
+            if fw is None:
+                fname = os.path.basename(path)
+                fw = next((f for f in fw_by_rel.values()
+                           if f['filename'] == fname), None)
+            if fw is None:
+                raise Exception(
+                    f"Файл прошивки '{path}' из сценария не найден ни на "
+                    f"устройстве, ни в директории "
+                    f"'{self.config.get('firmware_dir', '')}'")
+            _fmt, _ok, _supported, warning = fw_name_format(
+                fw['filename'], parsed=fw)
+            if not _supported:
+                if bool(self.config.get('format_control', True)):
+                    raise Exception(
+                        f"Файл прошивки '{fw['filename']}' из сценария не "
+                        f"прошёл контроль формата ({warning or 'формат недопустим'}). "
+                        f"Отключите опцию «Контроль формата прошивок», чтобы "
+                        f"разрешить загрузку")
+                if warning:
+                    self.log(f"Предупреждение: {warning}")
+            sub = os.path.dirname(fw['rel_path'])
+            ssh.exec_command(f"mkdir -p /home/user/fw_update/images/{sub}"
+                             if sub else "true")
+            ssh.sftp_put(fw['local_path'], remote)
+            uploaded += 1
+        self.log(f"Файлы прошивок из СП: на устройстве {present}, "
+                 f"дозагружено {uploaded}")
+        return [m['slot'] for m in rows]
 
     def _upload_selected_firmwares(self, ssh):
         """Доказательная загрузка на устройство прошивок, выбранных в СП.
@@ -1479,19 +1604,33 @@ class OperationWorker(QThread):
                      "сценарий будет собран автозаполнением")
         self.progress_signal.emit(100)
         if self.op_id == 11 and self.config.get('_auto_after_prepare'):
-            # v1.75: цепочка Автопрошивки, шаг 3 — данные подготовлены,
-            # строки сценария ещё не собраны (это делает GUI-шаг 3).
-            # Сохранение plan.xml выполнит отдельный запуск op 13
-            # (_op13_quiet_save), поэтому сюда эмитим 'edit' с флагом
-            # '_auto_prepare' — GUI обработает его без открытия диалога.
+            # v1.76: цепочка Автопрошивки, шаг 3 — данные подготовлены,
+            # строки сценария (_auto_rows) уже собраны GUI (этап A).
+            # Тихое сохранение plan.xml выполняется СЕЙЧАС ЖЕ внутри этого
+            # же воркера op 11 (метод _op13_quiet_save с SSH-соединением),
+            # а не отдельным запуском op 13 из обработчика finished-сигнала.
+            # Раньше новый воркер стартовал до завершения текущего потока
+            # (run() ещё не вернулся, isRunning()==True) — start_operation
+            # отвечал «Уже выполняется другая операция» и цепочка зависала.
+            ssh = None
+            try:
+                ssh = SSHClient(self.config['ip'], self.config['password'])
+                ssh.connect()
+                self._op13_quiet_save(ssh=ssh)
+            finally:
+                if ssh is not None:
+                    try:
+                        ssh.close()
+                    except Exception:
+                        pass
             self.log(f"Данные для редактора подготовлены. Модулей: "
                      f"{len(modules_info)}, прошивок: {len(firmwares)}")
-            self.finished_signal.emit(True, "Данные получены", {
+            self.finished_signal.emit(True, "СП сохранён (тихий режим)", {
                 "modules_info": modules_info,
                 "plan_modules": plan_modules,
                 "firmwares": firmwares,
                 "action": "edit",
-                "_auto_prepare": True
+                "_auto_saved": True,
             })
             return
         self.log(f"Данные для редактора подготовлены. Модулей: {len(modules_info)}, прошивок: {len(firmwares)}")
@@ -1689,12 +1828,21 @@ class OperationWorker(QThread):
         self.progress_signal.emit(100)
         self.log(f"Сценарий выгружен в: {local_path}")
 
-    def _op6_update(self, ssh):
+    def _op6_update(self, ssh, plan_rows=None):
+        """Update: проверка/дозагрузка файлов СП и запуск агента.
+
+        v1.76: plan_rows — строки сценария из тихого режима Автопрошивки;
+        если переданы, проверка файлов и контроль типов образов выполняются
+        по ним, а не по локальному файлу plan_xml (который может отсутствовать
+        или содержать имена из предыдущего сценария)."""
         self.log("Проверка наличия агента и файлов прошивок на устройстве...")
         if not ssh.sftp_stat("/home/user/fw_update/IskraIO_Util"):
             raise Exception("Агент IskraIO_Util отсутствует. Сначала выполните 'Внедрить агента и прошивки'.")
-        # Доказательная проверка/дозагрузка файлов из СП (plan.xml) перед Update
-        plan_slots = self._upload_selected_firmwares(ssh)
+        # Доказательная проверка/дозагрузка файлов из СП перед Update
+        if plan_rows is not None:
+            plan_slots = self._upload_rows_firmwares(ssh, plan_rows)
+        else:
+            plan_slots = self._upload_selected_firmwares(ssh)
         remote_images = ssh.sftp_listdir("/home/user/fw_update/images")
         if not remote_images:
             raise Exception("Директория /home/user/fw_update/images/ пуста. Сначала выполните 'Внедрить агента и прошивки'.")
@@ -1704,8 +1852,11 @@ class OperationWorker(QThread):
         # формата запрещена прошивка full-файлами (агенты с планом, где
         # type="full", на Update не запускаются).
         if bool(self.config.get('format_control', True)):
-            plan_modules = parse_plan_xml(self.config['plan_xml']) \
-                if os.path.isfile(self.config.get('plan_xml', '')) else []
+            if plan_rows is not None:
+                plan_modules = plan_rows
+            else:
+                plan_modules = parse_plan_xml(self.config['plan_xml']) \
+                    if os.path.isfile(self.config.get('plan_xml', '')) else []
             bad_types = [m for m in plan_modules
                          if normalize_img_type(m.get('img_type')) not in
                          ('apply', 'boot')]
@@ -1847,39 +1998,43 @@ class OperationWorker(QThread):
     # ---------------------------------------------------------------
 
     def _op13_auto_flash_tail(self, ssh):
-        """Шаг 6 Автопрошивки: сохранение собранного тихим редактором СП
-        (rows) как plan.xml на устройство и запуск прошивки (Update).
+        """v1.76: шаг 4 цепочки Автопрошивки — запись собранного тихим
+        редактором СП (rows) как plan.xml на устройство и запуск Update.
 
-        Строки сценария (с заполненными путями appl и типами) приходят из
-        GUI-шага тихого редактора через config['_auto_rows']. Диалог
-        результата показывается в GUI после успешного завершения шага."""
+        Строки сценария (с заполненными путями appl/boot и типами) приходят
+        из GUI-шага тихого редактора через config['_auto_rows']. Путь к
+        локальному plan_xml в конфиге при этом не используется — проверка/
+        дозагрузка файлов выполняется прямо по строкам сценария
+        (_upload_rows_firmwares), что устраняет ошибку «файл прошивки
+        boot_... не найден» (раньше Update читал старый plan.xml с диска,
+        где могли оставаться имена из предыдущего сценария)."""
         rows = self.config.get('_auto_rows') or []
         selected = [r for r in rows if r.get('path')]
         if not selected:
             raise Exception("Автопрошивка: сценарий пуст — нет строк "
                             "с указанными путями прошивок")
 
-        # Контроль формата имён (включённый блокирует невалидные имена/full)
+        # Контроль формата имён (включённый блокирует невалидные имена/full).
+        # v1.76: контроль — через fw_name_format с результатом разбора имени
+        # (короткие 'appl_..._r.bin' корректны; некорректны имена, в которых
+        # парсер не обнаружил тип модуля/версию/тип прошивки, и full).
         format_control = bool(self.config.get('format_control', True))
         for row in selected:
             fname = os.path.basename(row['path'])
             info = parse_firmware_filename(fname)
-            parsed_ok = info is not None
+            if info is None:
+                info = _try_parse_short_fw_name(fname)
             src = detect_fw_source(row['path'])
-            if format_control:
-                if not parsed_ok:
-                    raise Exception(
-                        f"Автопрошивка: файл '{fname}' не прошёл контроль "
-                        f"формата имени")
-                if src == 'full':
-                    raise Exception(
-                        f"Автопрошивка: файл '{fname}' имеет формат full — "
-                        "он пока не поддерживается")
-            elif not parsed_ok or src == 'full':
-                self.log(f"ВНИМАНИЕ: файл '{fname}' "
-                         + ("имеет формат full (не поддерживается)"
-                            if src == 'full' else "имеет некорректное имя")
-                         + " — прошивается при отключённом контроле формата")
+            _, _ok, supported, warning = fw_name_format(fname, parsed=info)
+            if src == 'full':
+                supported = False
+            if format_control and not supported:
+                raise Exception(
+                    f"Автопрошивка: файл '{fname}' не прошёл контроль "
+                    f"формата ({warning or 'имя некорректно или формат full'})")
+            if not supported and warning:
+                self.log(f"ВНИМАНИЕ: {warning} — прошивается при "
+                         "отключённом контроле формата")
 
         # Запись plan.xml (<Root>, type="appl") на устройство
         xml_lines = ['<Root>']
@@ -1905,17 +2060,23 @@ class OperationWorker(QThread):
             self._safe_remove(local_plan)
         self.progress_signal.emit(20)
 
-        # Прошивка (Update)
+        # Прошивка (Update). v1.76: проверка/дозагрузка файлов выполняется
+        # по строкам сценария (_auto_rows), а не по локальному plan_xml —
+        # иначе Update читал старый файл СП с диска и выдавал «файл
+        # прошивки boot_... не найден», хотя редактор сохранил другие имена.
         self.log("--- Автопрошивка: запуск прошивки (Update) ---")
-        self._op6_update(ssh)
+        self._op6_update(ssh, plan_rows=selected)
         self.progress_signal.emit(100)
 
-    def _op13_quiet_save(self):
-        """v1.73: тихое сохранение собранного СП на устройство без SSH-потока.
+    def _op13_quiet_save(self, ssh=None):
+        """v1.73: тихое сохранение собранного СП на устройство.
 
-        Используется шагом 3 цепочки Автопрошивки (данные подготовлены
-        воркером op 11, строки сценария — в config['_auto_rows']). Диалог
-        редактора при этом не открывается."""
+        v1.76: вызывается из воркера op 11 (цепочка Автопрошивки, шаг 3)
+        с уже открытым SSH-соединением — сохранение plan.xml выполняется в
+        том же потоке до emit finished, чтобы GUI не запускал новый воркер
+        из обработчика сигнала (это приводило к зависанию цепочки на шаге
+        2/6: «Уже выполняется другая операция»). Вызов без ssh создаёт своё
+        соединение (обратная совместимость)."""
         rows = self.config.get('_auto_rows') or []
         selected = [r for r in rows if r.get('path')]
         if not selected:
@@ -1933,32 +2094,36 @@ class OperationWorker(QThread):
         tree = ET.ElementTree(root)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
             tmp_path = tmp.name
+        own_conn = ssh is None
         try:
             tree.write(tmp_path, encoding='utf-8', xml_declaration=True)
-            ssh = SSHClient(self.config['ip'], self.config['password'])
-            try:
+            if own_conn:
+                ssh = SSHClient(self.config['ip'], self.config['password'])
                 ssh.connect()
-                self.log(f"Тихое сохранение plan.xml "
-                         f"(строк сценария: {len(selected)})...")
-                ssh.sftp_put(tmp_path, "/home/user/fw_update/plan.xml")
-                # v1.75: запись о сохранении СП на устройство в операционном логе
-                self.log(f"Сохранение СП на устройство выполнено "
-                         f"(/home/user/fw_update/plan.xml, строк: {len(selected)})")
-            finally:
+            self.log(f"Тихое сохранение plan.xml "
+                     f"(строк сценария: {len(selected)})...")
+            ssh.sftp_put(tmp_path, "/home/user/fw_update/plan.xml")
+            # v1.75: запись о сохранении СП на устройство в операционном логе
+            self.log(f"Сохранение СП на устройство выполнено "
+                     f"(/home/user/fw_update/plan.xml, строк: {len(selected)})")
+        finally:
+            if own_conn and ssh is not None:
                 try:
                     ssh.close()
                 except Exception:
                     pass
-        finally:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
         self.progress_signal.emit(100)
-        # v1.75: '_auto_saved' — маркер для цепочки Автопрошивки (шаг 3,
-        # этап B): СП сохранён на устройство, можно переходить к прошивке.
-        self.finished_signal.emit(True, "СП сохранён (тихий режим)",
-                                  {"_auto_saved": True})
+        # v1.76: '_auto_saved' — маркер для цепочки Автопрошивки; emit
+        # выполняется только когда метод вызван как самостоятельный воркер
+        # op 13 (обратная совместимость). При вызове из воркера op 11
+        # ('_auto_after_prepare') finished эмитит сам op 11 после метода.
+        if own_conn:
+            self.finished_signal.emit(True, "СП сохранён (тихий режим)",
+                                      {"_auto_saved": True})
 
     @staticmethod
     def _safe_remove(path):
@@ -2959,6 +3124,8 @@ class MainWindow(QMainWindow):
             (6, "Запустить прошивку", "col1_btn_6"),
             # v1.75: «Выгрузить дамп» перенесена в диалог «Просмотр результата»
             (8, "Просмотр результата", "col1_btn_8"),
+            # v1.76: «Удалить агента» перенесена из правой колонки в левую
+            (12, "Удалить агента", "col1_btn_12"),
         ]
         for i, (op_id, text, obj_name) in enumerate(col1_ops):
             btn = QPushButton(text)
@@ -2970,11 +3137,8 @@ class MainWindow(QMainWindow):
             (3, "Импортировать СП", "col2_btn_3"),
             (4, "Экспортировать СП", "col2_btn_4"),
             (9, "Редактировать СП", "col2_btn_9"),
-            # v1.75: кнопки меняются местами — «Автопрошивка» на месте
-            # «Удалить агента» (крупная заметная кнопка), «Удалить агента» —
-            # на месте бывшей «Выгрузить дамп».
-            # v1.73: удаление директории агента и прошивок с контроллера
-            (12, "Удалить агента", "col2_btn_12"),
+            # v1.76: «Удалить агента» перенесена в левую колонку; в правой
+            # осталась только «Автопрошивка» (занимает 2 строки).
             # v1.73: последовательная цепочка «под ключ» в тихом режиме
             (13, "Автопрошивка", "col2_btn_13")
         ]
@@ -2982,8 +3146,13 @@ class MainWindow(QMainWindow):
             btn = QPushButton(text)
             btn.setObjectName(obj_name)
             btn.clicked.connect(lambda checked, oid=op_id: self.start_operation(oid))
-            ops_layout.addWidget(btn, i, 1)
-        # v1.75: «Автопрошивка» визуально выделяется (яркая зелёная кнопка)
+            if op_id == 13:
+                ops_layout.addWidget(btn, i, 1, 2, 1)
+            else:
+                ops_layout.addWidget(btn, i, 1)
+        # v1.76: стиль кнопки «Автопрошивка» — как у остальных кнопок
+        # (фон задаётся таблицей стилей по objectName); оставлены только
+        # жирный шрифт и увеличенная высота для заметности.
         auto_btn = self.findChild(QPushButton, "col2_btn_13")
         if auto_btn is not None:
             f = auto_btn.font()
@@ -2991,13 +3160,6 @@ class MainWindow(QMainWindow):
             f.setPointSize(f.pointSize() + 2)
             auto_btn.setFont(f)
             auto_btn.setMinimumHeight(48)
-            auto_btn.setStyleSheet(
-                "QPushButton#col2_btn_13 {"
-                " background-color: #2e7d32; color: white;"
-                " border: 1px solid #1b5e20; border-radius: 6px; }"
-                "QPushButton#col2_btn_13:hover { background-color: #388e3c; }"
-                "QPushButton#col2_btn_13:pressed { background-color: #1b5e20; }"
-                "QPushButton#col2_btn_13:disabled { background-color: #a5a5a5; }")
         ops_group.setLayout(ops_layout)
         main_layout.addWidget(ops_group)
 
@@ -3170,6 +3332,8 @@ class MainWindow(QMainWindow):
                                 "Уже выполняется другая операция. "
                                 "Дождитесь её завершения.")
             return
+        # v1.76: цепочка Автопрошивки — интерактивные проверки пропускаются
+        in_auto_chain_pre = getattr(self, "_auto_step", 0) > 0
         config = self.get_current_config()
         if not config['ip'] or not config['password']:
             QMessageBox.critical(self, "Ошибка", "Укажите IP-адрес и пароль!")
@@ -3186,15 +3350,20 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.StandardButton.Cancel:
                     return
         elif op_id == 2:
-            if not self.check_agent_exists():
-                QMessageBox.critical(self, "Ошибка",
-                                     "Агент IskraIO_Util отсутствует. Сначала выполните 'Внедрить агента и прошивки'.")
-                return
-            reply = QMessageBox.warning(self, "Предупреждение",
-                                        "Телемеханика будет остановлена. Продолжить?",
-                                        QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
-            if reply == QMessageBox.StandardButton.Cancel:
-                return
+            # v1.76: в цепочке Автопрошивки (тихий режим) интерактивные
+            # проверки не выполняются — агент проверяется на устройстве
+            # внутри операции MakePlan, остановка телемеханики подтверждена
+            # самим пользователем запуском цепочки.
+            if not in_auto_chain_pre:
+                if not self.check_agent_exists():
+                    QMessageBox.critical(self, "Ошибка",
+                                         "Агент IskraIO_Util отсутствует. Сначала выполните 'Внедрить агента и прошивки'.")
+                    return
+                reply = QMessageBox.warning(self, "Предупреждение",
+                                            "Телемеханика будет остановлена. Продолжить?",
+                                            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+                if reply == QMessageBox.StandardButton.Cancel:
+                    return
         elif op_id == 6:
             reply = QMessageBox.warning(self, "Предупреждение",
                                         "Телемеханика будет остановлена. Продолжить?",
@@ -3255,16 +3424,22 @@ class MainWindow(QMainWindow):
             # Шаг 4 цепочки — запись plan.xml + Update; шаг 3 — тихое
             # сохранение СП без SSH-потока (данные подготовлены на шаге 3).
             cfg['_auto_update'] = (self._auto_step == 4)
-        # v1.75: шаг 3 цепочки (тихий редактор) выполняется в два этапа —
-        # подготовка данных (op 11) и тихое сохранение СП (op 13 без SSH).
-        # Раньше на этом шаге сразу запускалась прошивка (cfg['_auto_update']
-        # ставился по номеру шага), и _auto_rows к моменту сохранения ещё не
-        # были заполнены — цепочка падала с «сценарий пуст». Теперь воркер
-        # op 11 получает флаг '_auto_after_prepare': после подготовки данных
-        # он сам запустит тихое сохранение plan.xml.
+        # v1.75/v1.76: шаг 3 цепочки (тихий редактор) выполняется в два
+        # этапа — A: подготовка данных (воркер op 11), сборка строк СП GUI;
+        # B: тихое сохранение plan.xml на устройство. В v1.76 этап B
+        # выполняется ВНУТРИ того же воркера op 11 (_op13_quiet_save с SSH),
+        # поэтому новый воркер из обработчика finished-сигнала не запускается
+        # и цепочка не зависает на «Уже выполняется другая операция».
+        # Строки СП передаются воркеру заранее через cfg['_auto_rows'].
         if op_id == 13 and in_auto_chain and self._auto_step == 3:
             worker_op = 11
             cfg['_auto_after_prepare'] = True
+        # Шаг 2 цепочки (MakePlan): локальная проверка агента заменена на
+        # удалённую проверку состояния сервисов PrjA/PrjA-tele — агент лежит
+        # на контроллере, а не на диске ПК, и раньше шаг 2 падал сразу после
+        # старта цепочки («зависание» наблюдалось именно здесь).
+        if op_id == 2 and in_auto_chain:
+            cfg['_skip_local_checks'] = True
         self.worker = OperationWorker(worker_op, cfg, quiet=quiet,
                                       on_log=self.append_log)
         self.worker.log_signal.connect(self.append_log)
@@ -3484,11 +3659,11 @@ class MainWindow(QMainWindow):
                 self._start_dump_from_dialog(d, m, r))
             dialog.exec()
         elif action == "edit":
-            # v1.75: шаг 3 цепочки Автопрошивки — данные подготовлены
-            # воркером op 11 ('_auto_prepare'); обработка (сборка СП +
-            # тихое сохранение) выполняется в _auto_flash_step_done,
-            # диалог редактора НЕ открывается.
-            if getattr(self, "_auto_step", 0) > 0 and data.get("_auto_prepare"):
+            # v1.76: шаг 3 цепочки Автопрошивки — данные подготовлены и СП
+            # уже сохранён на устройство воркером op 11 ('_auto_saved');
+            # обработка перехода к прошивке выполняется в
+            # _auto_flash_step_done, диалог редактора НЕ открывается.
+            if getattr(self, "_auto_step", 0) > 0 and data.get("_auto_saved"):
                 return
             dialog = EditSPDialog(
                 data["modules_info"],
