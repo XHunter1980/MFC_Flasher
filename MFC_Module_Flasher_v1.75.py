@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.74"
+APP_VERSION = "1.75"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -819,10 +819,14 @@ class OperationWorker(QThread):
         "Файлы формата full:",
     )
 
-    def __init__(self, op_id, config, quiet=False):
+    def __init__(self, op_id, config, quiet=False, on_log=None):
         super().__init__()
         self.op_id = op_id
         self.config = config
+        # v1.75: необязательный колбэк записи в операционный лог — позволяет
+        # писать события из GUI-компонентов (например, «Сохранение СП на
+        # устройство» из редактора), у которых нет собственного log_signal.
+        self._on_log = on_log
         # v1.70: два режима операционного лога — краткий (по умолчанию) и
         # подробный (с детализацией). Флаг читается из конфига.
         self.verbose_log = bool(config.get('verbose_log', False))
@@ -849,6 +853,18 @@ class OperationWorker(QThread):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_signal.emit(f"[{timestamp}] {msg}")
 
+    @staticmethod
+    def log_via(callback, msg):
+        """v1.75: запись события в операционный лог через колбэк (для
+        GUI-компонентов без собственного сигнала — редактор СП)."""
+        if callback is None:
+            return
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            callback(f"[{timestamp}] {msg}")
+        except Exception:
+            pass
+
     def run(self):
         ssh = None
         try:
@@ -865,7 +881,6 @@ class OperationWorker(QThread):
                 # v1.73: шаг тихого сохранения СП (без SSH-потока)
                 self._op13_quiet_save()
                 return
-
             ssh = SSHClient(self.config['ip'], self.config['password'])
             ssh.connect()
             self.log("Подключение к устройству установлено")
@@ -1463,6 +1478,22 @@ class OperationWorker(QThread):
             self.log("Тихий режим: plan.xml не выгружается — "
                      "сценарий будет собран автозаполнением")
         self.progress_signal.emit(100)
+        if self.op_id == 11 and self.config.get('_auto_after_prepare'):
+            # v1.75: цепочка Автопрошивки, шаг 3 — данные подготовлены,
+            # строки сценария ещё не собраны (это делает GUI-шаг 3).
+            # Сохранение plan.xml выполнит отдельный запуск op 13
+            # (_op13_quiet_save), поэтому сюда эмитим 'edit' с флагом
+            # '_auto_prepare' — GUI обработает его без открытия диалога.
+            self.log(f"Данные для редактора подготовлены. Модулей: "
+                     f"{len(modules_info)}, прошивок: {len(firmwares)}")
+            self.finished_signal.emit(True, "Данные получены", {
+                "modules_info": modules_info,
+                "plan_modules": plan_modules,
+                "firmwares": firmwares,
+                "action": "edit",
+                "_auto_prepare": True
+            })
+            return
         self.log(f"Данные для редактора подготовлены. Модулей: {len(modules_info)}, прошивок: {len(firmwares)}")
         self.finished_signal.emit(True, "Данные получены", {
             "modules_info": modules_info,
@@ -1910,6 +1941,9 @@ class OperationWorker(QThread):
                 self.log(f"Тихое сохранение plan.xml "
                          f"(строк сценария: {len(selected)})...")
                 ssh.sftp_put(tmp_path, "/home/user/fw_update/plan.xml")
+                # v1.75: запись о сохранении СП на устройство в операционном логе
+                self.log(f"Сохранение СП на устройство выполнено "
+                         f"(/home/user/fw_update/plan.xml, строк: {len(selected)})")
             finally:
                 try:
                     ssh.close()
@@ -1921,7 +1955,10 @@ class OperationWorker(QThread):
             except OSError:
                 pass
         self.progress_signal.emit(100)
-        self.finished_signal.emit(True, "СП сохранён (тихий режим)", {})
+        # v1.75: '_auto_saved' — маркер для цепочки Автопрошивки (шаг 3,
+        # этап B): СП сохранён на устройство, можно переходить к прошивке.
+        self.finished_signal.emit(True, "СП сохранён (тихий режим)",
+                                  {"_auto_saved": True})
 
     @staticmethod
     def _safe_remove(path):
@@ -1988,7 +2025,10 @@ class ModuleInfoDialog(QDialog):
 
 
 class ViewResultDialog(QDialog):
-    def __init__(self, modules, results, parent=None):
+    # v1.75: кнопка «Выгрузить дамп» перенесена из главной формы в этот
+    # диалог (требование заказчика). Запуск операции выполняет колбэк,
+    # переданный главным окном (worker-операция 7).
+    def __init__(self, modules, results, parent=None, on_dump=None):
         super().__init__(parent)
         self.setWindowTitle("Результат прошивки")
         self.resize(750, 450)
@@ -2028,6 +2068,15 @@ class ViewResultDialog(QDialog):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         table.resizeRowsToContents()
         layout.addWidget(table)
+        # v1.75: кнопка «Выгрузить дамп» — перенесена в диалог из главной формы
+        self.dump_btn = QPushButton("Выгрузить дамп")
+        self.dump_btn.setObjectName("dialog_btn_dump")
+        if on_dump is not None:
+            self.dump_btn.clicked.connect(
+                lambda checked=False: on_dump(self))
+        else:
+            self.dump_btn.setEnabled(False)
+        layout.addWidget(self.dump_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         for btn in btn_box.buttons():
             btn.setObjectName("dialog_btn_ok")
@@ -2047,10 +2096,13 @@ class EditSPDialog(QDialog):
     COL_COUNT = 8
 
     def __init__(self, modules_info, plan_modules, firmwares, config,
-                 parent=None, quiet=False):
+                 parent=None, quiet=False, on_log=None):
         super().__init__(parent)
         # v1.73: тихий режим (Автопрошивка) — без диалоговых окон
         self.quiet = quiet
+        # v1.75: колбэк записи в операционный лог главного окна
+        # (сохранение СП на устройство фиксируется в журнале)
+        self._log_cb = on_log
         self.setWindowTitle("Редактирование сценария прошивки")
         self.resize(1600, 820)
         self.config = config
@@ -2796,6 +2848,11 @@ class EditSPDialog(QDialog):
             ssh.sftp_put(tmp_path, "/home/user/fw_update/plan.xml")
             ssh.close()
             os.remove(tmp_path)
+            # v1.75: сохранение СП на устройство фиксируется в операционном логе
+            OperationWorker.log_via(
+                self._log_cb,
+                f"Сохранение СП на устройство выполнено "
+                f"(/home/user/fw_update/plan.xml, строк сценария: {len(selected)})")
             QMessageBox.information(self, "Успех", "Сценарий успешно сохранён на устройстве")
             self.accept()
         except Exception as e:
@@ -2820,6 +2877,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None  # v1.66: текущий воркер операции (защита от параллельного запуска)
+        # v1.75: инициализация состояния цепочки «Автопрошивка» — раньше
+        # атрибут _auto_step создавался лениво, и start_operation(13)
+        # обращался к нему напрямую (self._auto_step == 0), что давало
+        # AttributeError: 'MainWindow' object has no attribute '_auto_step'
+        self._auto_step = 0
+        self._auto_failed = False
+        self._auto_failed_step = None
+        self._auto_rows = None
+        # v1.75: данные для повторного открытия диалога «Просмотр результата»
+        # после выгрузки дампа (None — обычный режим, не возврат из дампа)
+        self._dump_reopen_data = None
+        self._ops_busy = False
         self.setWindowTitle(APP_TITLE)
         self.resize(1000, 800)
         self.config = self.load_config()
@@ -2888,8 +2957,8 @@ class MainWindow(QMainWindow):
             (1, "Внедрить агента и прошивки", "col1_btn_1"),
             (10, "Информация о модулях", "col1_btn_10"),
             (6, "Запустить прошивку", "col1_btn_6"),
+            # v1.75: «Выгрузить дамп» перенесена в диалог «Просмотр результата»
             (8, "Просмотр результата", "col1_btn_8"),
-            (7, "Выгрузить дамп", "col1_btn_7")
         ]
         for i, (op_id, text, obj_name) in enumerate(col1_ops):
             btn = QPushButton(text)
@@ -2901,6 +2970,9 @@ class MainWindow(QMainWindow):
             (3, "Импортировать СП", "col2_btn_3"),
             (4, "Экспортировать СП", "col2_btn_4"),
             (9, "Редактировать СП", "col2_btn_9"),
+            # v1.75: кнопки меняются местами — «Автопрошивка» на месте
+            # «Удалить агента» (крупная заметная кнопка), «Удалить агента» —
+            # на месте бывшей «Выгрузить дамп».
             # v1.73: удаление директории агента и прошивок с контроллера
             (12, "Удалить агента", "col2_btn_12"),
             # v1.73: последовательная цепочка «под ключ» в тихом режиме
@@ -2911,6 +2983,21 @@ class MainWindow(QMainWindow):
             btn.setObjectName(obj_name)
             btn.clicked.connect(lambda checked, oid=op_id: self.start_operation(oid))
             ops_layout.addWidget(btn, i, 1)
+        # v1.75: «Автопрошивка» визуально выделяется (яркая зелёная кнопка)
+        auto_btn = self.findChild(QPushButton, "col2_btn_13")
+        if auto_btn is not None:
+            f = auto_btn.font()
+            f.setBold(True)
+            f.setPointSize(f.pointSize() + 2)
+            auto_btn.setFont(f)
+            auto_btn.setMinimumHeight(48)
+            auto_btn.setStyleSheet(
+                "QPushButton#col2_btn_13 {"
+                " background-color: #2e7d32; color: white;"
+                " border: 1px solid #1b5e20; border-radius: 6px; }"
+                "QPushButton#col2_btn_13:hover { background-color: #388e3c; }"
+                "QPushButton#col2_btn_13:pressed { background-color: #1b5e20; }"
+                "QPushButton#col2_btn_13:disabled { background-color: #a5a5a5; }")
         ops_group.setLayout(ops_layout)
         main_layout.addWidget(ops_group)
 
@@ -2949,7 +3036,11 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(bottom_layout)
 
         self.all_ops = [(op_id, text) for op_id, text, _ in col1_ops + col2_ops]
-        # v1.66: кнопки операций для блокировки на время выполнения
+        # v1.75: «Выгрузить дамп» перенесена из главной формы в диалог
+        # «Просмотр результата»; операцию (op 7) по-прежнему можно запускать
+        # — регистрируем её в списке операций отдельно от кнопок формы.
+        self.all_ops.append((7, "Выгрузить дамп"))
+        # v.66: кнопки операций для блокировки на время выполнения
         self.op_buttons = {}
         for i, (op_id, _text, _obj_name) in enumerate(col1_ops):
             self.op_buttons[op_id] = ops_layout.itemAtPosition(i, 0).widget()
@@ -3164,7 +3255,18 @@ class MainWindow(QMainWindow):
             # Шаг 4 цепочки — запись plan.xml + Update; шаг 3 — тихое
             # сохранение СП без SSH-потока (данные подготовлены на шаге 3).
             cfg['_auto_update'] = (self._auto_step == 4)
-        self.worker = OperationWorker(worker_op, cfg, quiet=quiet)
+        # v1.75: шаг 3 цепочки (тихий редактор) выполняется в два этапа —
+        # подготовка данных (op 11) и тихое сохранение СП (op 13 без SSH).
+        # Раньше на этом шаге сразу запускалась прошивка (cfg['_auto_update']
+        # ставился по номеру шага), и _auto_rows к моменту сохранения ещё не
+        # были заполнены — цепочка падала с «сценарий пуст». Теперь воркер
+        # op 11 получает флаг '_auto_after_prepare': после подготовки данных
+        # он сам запустит тихое сохранение plan.xml.
+        if op_id == 13 and in_auto_chain and self._auto_step == 3:
+            worker_op = 11
+            cfg['_auto_after_prepare'] = True
+        self.worker = OperationWorker(worker_op, cfg, quiet=quiet,
+                                      on_log=self.append_log)
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_operation_finished)
@@ -3199,8 +3301,10 @@ class MainWindow(QMainWindow):
         step = self._auto_step
         name = self.AUTO_STEPS.get(step, "")
         self.append_log(f"[Автопрошивка] Шаг {step}/6: {name}")
-        op_map = {1: 1, 2: 2, 3: 11, 4: 13, 5: 8, 6: 12}
-        # Для шага 3 внутри start_operation(13) создаётся воркер op 11
+        op_map = {1: 1, 2: 2, 3: 13, 4: 13, 5: 8, 6: 12}
+        # Шаг 3 (тихий редактор) запускается как op 13 — внутри
+        # start_operation он перенаправляется на воркер op 11 с флагом
+        # '_auto_after_prepare' (подготовка данных без открытия диалога).
         self.start_operation(op_map[step])
 
     def _auto_finish(self, reason=None):
@@ -3243,9 +3347,15 @@ class MainWindow(QMainWindow):
                 self._auto_finish()
             return
         if step == 3:
-            # Тихий редактор: данные подготовлены — собираем СП без открытия
-            # диалога (автозаполнение appl + валидация строк), затем тихое
-            # сохранение plan.xml на устройство (шаг выполняется воркером).
+            # v1.75: тихий редактор в два этапа. Этап A (action
+            # 'auto_prepare') — данные подготовлены, собираем СП в памяти
+            # (тихий диалог-неоткрытушка: автозаполнение appl) и запускаем
+            # этап B — тихое сохранение plan.xml на устройство (op 13).
+            # Этап B ('_auto_saved') — СП сохранён, переходим к прошивке.
+            if data.get("_auto_saved"):
+                self._auto_step += 1
+                self._auto_run_step()
+                return
             try:
                 dialog = EditSPDialog(
                     data["modules_info"], data["plan_modules"],
@@ -3266,8 +3376,22 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._auto_abort(f"Ошибка тихого редактирования СП: {e}")
                 return
-            self._auto_step += 1
-            self._auto_run_step()
+            # Этап B: тихое сохранение собранного СП на устройство.
+            # Флаг '_auto_saved' в finished_signal ставит сам воркер
+            # (_op13_quiet_save) — по нему цепочка поймёт, что этап B
+            # завершён и можно переходить к прошивке (шаг 4).
+            try:
+                cfg = dict(self.get_current_config())
+                cfg['_auto_rows'] = self._auto_rows
+                cfg['_auto_update'] = False
+                self.worker = OperationWorker(13, cfg, quiet=True,
+                                              on_log=self.append_log)
+                self.worker.log_signal.connect(self.append_log)
+                self.worker.progress_signal.connect(self.progress_bar.setValue)
+                self.worker.finished_signal.connect(self.on_operation_finished)
+                self.worker.start()
+            except Exception as e:
+                self._auto_abort(f"Не удалось сохранить СП: {e}")
             return
         # Шаги 1, 2, 4, 5 — переход к следующему
         if step == 5 and success:
@@ -3277,6 +3401,24 @@ class MainWindow(QMainWindow):
         self._auto_run_step()
 
     def on_operation_finished(self, success, message, data):
+        # v1.75: завершение любой операции отображается в оперативном логе;
+        # выгрузка дампа из диалога результата — без дублирующей строки
+        # («завершена» напишется один раз при возврате в диалог).
+        try:
+            if getattr(self, "_auto_step", 0) == 0 and not data.get("_silent"):
+                op_name = next((name for oid, name in self.all_ops
+                                if oid == getattr(self.worker, "op_id", None)),
+                               "")
+                dump_reopen = (getattr(self, "_dump_reopen_data", None)
+                               is not None)
+                if op_name and not (dump_reopen and success):
+                    if success:
+                        self.append_log(f"--- Операция: {op_name} завершена ---")
+                    else:
+                        self.append_log(f"--- Операция: {op_name} "
+                                        f"завершена с ошибкой ---")
+        except Exception:
+            pass
         # v1.66: разблокировка кнопок выполняется в любом случае (finally),
         # чтобы исключение при открытии диалога не «замораживало» интерфейс.
         try:
@@ -3289,16 +3431,65 @@ class MainWindow(QMainWindow):
             if getattr(self, "_auto_step", 0) == 0:
                 self._set_ops_enabled(True)
 
+    def _start_dump_from_dialog(self, dialog, modules, results):
+        """v1.75: запуск операции «Выгрузить дамп» (op 7) из диалога
+        «Просмотр результата». Диалог закрывается на время выгрузки —
+        иначе модальный exec() блокирует главный поток и сигнал
+        завершения воркера не будет обработан."""
+        if getattr(self, "_ops_busy", False) or (
+                self.worker is not None and self.worker.isRunning()):
+            QMessageBox.warning(self, "Внимание",
+                                "Уже выполняется другая операция. "
+                                "Дождитесь её завершения.")
+            return
+        config = self.get_current_config()
+        if not config['ip'] or not config['password']:
+            QMessageBox.critical(self, "Ошибка", "Укажите IP-адрес и пароль!")
+            return
+        self._dump_reopen_data = (modules, results)
+        dialog.reject()
+        self.start_operation(7)
+
     def _handle_operation_result(self, success, message, data):
+        # v1.75: после успешной выгрузки дампа из диалога «Просмотр
+        # результата» — возвращаемся в тот же диалог (он открывался на
+        # время операции и закрывался, чтобы не блокировать главный поток).
+        reopen = getattr(self, "_dump_reopen_data", None)
+        if reopen is not None and success:
+            self._dump_reopen_data = None
+            modules, results = reopen
+            dialog = ViewResultDialog(
+                modules, results, self,
+                on_dump=lambda d, m=modules, r=results:
+                self._start_dump_from_dialog(d, m, r))
+            dialog.exec()
+            return
+        if reopen is not None and not success:
+            # дамп не выгружен — данные больше не нужны, ошибка ниже
+            self._dump_reopen_data = None
+
         if not success:
             QMessageBox.critical(self, "Ошибка", message)
             return
         action = data.get("action")
 
         if action == "result":
-            dialog = ViewResultDialog(data["modules"], data["results"], self)
+            # v1.75: «Выгрузить дамп» перенесена в этот диалог (op 7).
+            # Диалог закрывается на время выгрузки (иначе модальный exec()
+            # заблокирует главный поток и воркер не сможет завершиться);
+            # после успешной выгрузки он открывается повторно.
+            dialog = ViewResultDialog(
+                data["modules"], data["results"], self,
+                on_dump=lambda d, m=data["modules"], r=data["results"]:
+                self._start_dump_from_dialog(d, m, r))
             dialog.exec()
         elif action == "edit":
+            # v1.75: шаг 3 цепочки Автопрошивки — данные подготовлены
+            # воркером op 11 ('_auto_prepare'); обработка (сборка СП +
+            # тихое сохранение) выполняется в _auto_flash_step_done,
+            # диалог редактора НЕ открывается.
+            if getattr(self, "_auto_step", 0) > 0 and data.get("_auto_prepare"):
+                return
             dialog = EditSPDialog(
                 data["modules_info"],
                 data["plan_modules"],
@@ -3306,7 +3497,9 @@ class MainWindow(QMainWindow):
                 self.get_current_config(),
                 self,
                 # v1.73: тихий режим для Автопрошивки (без диалогов)
-                quiet=getattr(self, "_auto_step", 0) > 0
+                quiet=getattr(self, "_auto_step", 0) > 0,
+                # v1.75: сохранение СП на устройство пишется в операционный лог
+                on_log=self.append_log
             )
             self._auto_edit_dialog = dialog
             result = dialog.exec()
