@@ -28,6 +28,8 @@ jobs:
   build-windows:
     name: Сборка MFC_Flasher.exe (Windows)
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
 
     steps:
       - name: Checkout
@@ -97,11 +99,8 @@ jobs:
       - name: Скачивание артефакта сборки
         uses: actions/download-artifact@v4
         with:
-          pattern: MFC_Flasher_v*-windows
-          run-id: ${{ needs.build-windows.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: MFC_Flasher_v${{ needs.build-windows.outputs.version }}-windows
           path: exe
-          merge-multiple: true
 
       - name: Создание релиза и загрузка .exe (curl, ретраи, проверка доступности)
         env:
