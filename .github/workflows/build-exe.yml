@@ -61,6 +61,7 @@ jobs:
 
       - name: Иконка приложения (сжатие ICO если нужно)
         shell: bash
+        id: icon
         run: |
           # Иконка берётся из корня репозитория (файл MFC_moduleUpd.ico).
           # PyInstaller принимает только квадратные и корректно объявленные
@@ -72,7 +73,7 @@ jobs:
             echo "icon=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          python - <<'PY'
+          cat > make_icon.py <<'PY'
           from PIL import Image
           im = Image.open("MFC_moduleUpd.ico")
           sizes = [(s, s) for s in (16, 32, 48, 64, 128, 256)]
@@ -80,12 +81,12 @@ jobs:
               "app_icon.ico", sizes=sizes)
           print("app_icon.ico создан (квадратный, 16..256)")
           PY
+          python make_icon.py || echo "::warning::Конвертация ICO не удалась — используется оригинал"
           if [ -f app_icon.ico ]; then
             echo "icon=app_icon.ico" >> "$GITHUB_OUTPUT"
           else
             echo "icon=$ICON" >> "$GITHUB_OUTPUT"
           fi
-        id: icon
 
       - name: Сборка exe (onefile, без консоли, версия в имени, иконка)
         shell: bash
