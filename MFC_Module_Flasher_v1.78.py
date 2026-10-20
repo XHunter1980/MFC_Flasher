@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.77"
+APP_VERSION = "1.78"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -912,6 +912,13 @@ class OperationWorker(QThread):
         # дублировались (например «Просмотр результата завершена» x2).
         self._finished_emitted = False
 
+    def _emit_finished(self, success, message, data=None):
+        """v1.78: единая точка emit finished — ставит маркер ДО сигнала,
+        чтобы run() не эмитировал второй finished (дублирование строк
+        «Операция ... завершена» и повторное открытие диалогов)."""
+        self._finished_emitted = True
+        self.finished_signal.emit(success, message, data if data is not None else {})
+
     def _is_verbose_only(self, msg):
         """Относит ли сообщение к детализации, скрытой в кратком режиме."""
         if any(msg.startswith(m) or m in msg for m in self._VERBOSE_ONLY_MARKERS
@@ -956,13 +963,34 @@ class OperationWorker(QThread):
                 self._op11_prepare_edit_plan()
                 return
             if self.op_id == 13 and not self.config.get('_auto_update'):
-                # v1.73: шаг тихого сохранения СП (без SSH-потока)
-                self._op13_quiet_save()
-                # v1.77: _op13_quiet_save сам эмитит finished ('_auto_saved')
-                # — возврат обязателен, иначе run() доходит до конца и
-                # эмитит ВТОРОЙ finished («Операция завершена успешно»),
-                # из-за чего цепочка Автопрошивки переходила к следующему
-                # шагу дважды (дублирование операций и строк в логе).
+                # v1.78: шаг тихого сохранения СП. Данные редактора (список
+                # модулей, строки plan.xml, скан прошивок) подготовлены
+                # воркером шага 3 и переданы через config['_auto_*'] — этап A
+                # больше не запускается отдельным потоком из обработки
+                # finished-сигнала (это «вешало» цепочку на шаге с
+                # «Уже выполняется другая операция»). Строки СП собираются
+                # тихим автозаполнением appl прямо здесь, в этом же потоке,
+                # затем сразу сохраняется plan.xml.
+                cfg = self.config
+                # v1.78: строки СП могут прийти из GUI ('_auto_rows') либо
+                # быть собраны здесь из данных шага 3 ('_auto_data',
+                # переданных цепочке воркером op 11).
+                if (cfg.get('_auto_rows') is None
+                        and not cfg.get('_auto_built_rows')):
+                    ad = cfg.get('_auto_data') or {}
+                    if ad.get('modules_info') is not None:
+                        cfg['_auto_rows'] = self._auto_build_rows(
+                            ad['modules_info'],
+                            ad.get('plan_modules') or [],
+                            ad.get('firmwares') or [])
+                saved_rows = self._op13_quiet_save()
+                # v1.78: finished с данными цепочки эмитится ровно один раз
+                # (маркер ставит _emit_finished) — возврат обязателен, чтобы
+                # run() не добавил второй «Операция завершена успешно».
+                self._emit_finished(True, "СП сохранён (тихий режим)", {
+                    "_auto_saved": True,
+                    "_auto_rows": saved_rows or [],
+                })
                 return
             ssh = SSHClient(self.config['ip'], self.config['password'])
             ssh.connect()
@@ -1000,10 +1028,12 @@ class OperationWorker(QThread):
             # диалога и дублирующую строку «Операция ... завершена» в логе.
             if getattr(self, "_finished_emitted", False):
                 return
-            self.finished_signal.emit(True, "Операция завершена успешно", {})
+            self._emit_finished(True, "Операция завершена успешно")
         except Exception as e:
             self.log(f"Критическая ошибка: {e!s}")
-            self.finished_signal.emit(False, f"Ошибка: {e!s}", {})
+            # v1.78: маркер ставится в _emit_finished — повторный emit из
+            # run() исключён, дублирование строк «завершена» невозможно.
+            self._emit_finished(False, f"Ошибка: {e!s}")
         finally:
             if ssh is not None:
                 try:
@@ -1027,10 +1057,19 @@ class OperationWorker(QThread):
             self.log("Сценарий прошивки пуст — проверка файлов пропускается")
             return []
         fw_by_rel = {}
+        by_name = {}
         for fw in self._scan_firmware_dir():
             fw_by_rel[fw['rel_path']] = fw
+            by_name.setdefault(fw['filename'], fw)
+        # v1.78: список файлов, реально загруженных на устройство при шаге 1
+        # цепочки («Внедрить агента и прошивки») — имена берутся из plan.xml
+        # контроллера (актуальный сценарий), а не из локальной директории;
+        # раньше проверка искала файлы по устаревшим локальным именам и падала
+        # с «Файл прошивки ... не найден», хотя в план.xml были другие имена.
+        device_names = self._remote_image_names(ssh)
         uploaded = 0
         present = 0
+        missing = []
         for mod in rows:
             path = (mod.get('path') or '').replace('\\', '/')
             rel = re.sub(r'^images/', '', path)
@@ -1038,16 +1077,18 @@ class OperationWorker(QThread):
             if ssh.sftp_stat(remote):
                 present += 1
                 continue
-            fw = fw_by_rel.get(rel)
+            fname = os.path.basename(path)
+            fw = fw_by_rel.get(rel) or by_name.get(fname)
             if fw is None:
-                fname = os.path.basename(path)
                 fw = next((f for f in fw_by_rel.values()
                            if f['filename'] == fname), None)
             if fw is None:
-                raise Exception(
-                    f"Файл прошивки '{path}' из сценария не найден ни на "
-                    f"устройстве, ни в директории "
-                    f"'{self.config.get('firmware_dir', '')}'")
+                if fname in device_names:
+                    # файл уже лежит на устройстве (вложенный путь images/...)
+                    present += 1
+                    continue
+                missing.append(fname)
+                continue
             _fmt, _ok, _supported, warning = fw_name_format(
                 fw['filename'], parsed=fw)
             if not _supported:
@@ -1064,9 +1105,33 @@ class OperationWorker(QThread):
                              if sub else "true")
             ssh.sftp_put(fw['local_path'], remote)
             uploaded += 1
+        if missing:
+            raise Exception(
+                f"Файлы прошивок из сценария не найдены ни на устройстве, "
+                f"ни в директории '{self.config.get('firmware_dir', '')}': "
+                + ", ".join(sorted(set(missing))))
         self.log(f"Файлы прошивок из СП: на устройстве {present}, "
                  f"дозагружено {uploaded}")
         return [m['slot'] for m in rows]
+
+    def _remote_image_names(self, ssh):
+        """v1.78: рекурсивный список имён файлов в /home/user/fw_update/images.
+
+        Используется при проверке наличия прошивок из сценария: файлы шага 1
+        цепочки («Внедрить агента и прошивки») загружаются с сохранением
+        подпапок скана (images/<subdir>/<file>), поэтому поиск только по
+        корневому images/ давал ложное «файл не найден»."""
+        names = set()
+        try:
+            entries = ssh.exec_command(
+                "find /home/user/fw_update/images -type f 2>/dev/null")[0]
+            for line in entries.splitlines():
+                line = line.strip()
+                if line:
+                    names.add(os.path.basename(line))
+        except Exception:
+            pass
+        return names
 
     def _upload_selected_firmwares(self, ssh):
         """Доказательная загрузка на устройство прошивок, выбранных в СП.
@@ -1666,50 +1731,27 @@ class OperationWorker(QThread):
             # run() текущего потока (isRunning()==True), start_operation
             # отвечал «Уже выполняется другая операция» и цепочка зависала
             # на шаге 2/6 → 3. Теперь весь шаг 3 — один воркер op 11.
-            built_rows = []
-            try:
-                dialog = EditSPDialog(
-                    modules_info, plan_modules, firmwares, self.config,
-                    None, quiet=True)
-                dialog.autofill("apply")
-                for i, r in enumerate(dialog.rows):
-                    row = dict(r)
-                    row['path'] = dialog.path_edits[i].text().strip()
-                    row['img_type'] = dialog.type_combos[i].currentData()
-                    built_rows.append(row)
-                del dialog
-            except Exception as e:
-                raise Exception(
-                    f"Ошибка тихого редактирования СП: {e}") from e
-            if not any(r.get('path') and r.get('flashable', True)
-                       for r in built_rows):
-                raise Exception("Автопрошивка: автозаполнение appl не "
-                                "выбрало ни одного модуля — прошивать нечего")
-            self.config['_auto_built_rows'] = built_rows
-            ssh = None
-            try:
-                ssh = SSHClient(self.config['ip'], self.config['password'])
-                ssh.connect()
-                self._op13_quiet_save(ssh=ssh)
-            finally:
-                if ssh is not None:
-                    try:
-                        ssh.close()
-                    except Exception:
-                        pass
+            # v1.78: шаг 3 цепочки выполняется ДВУМЯ воркерами: этот
+            # (op 11) только готовит данные (модули/план/скан прошивок),
+            # а тихую сборку строк СП и сохранение plan.xml выполняет
+            # следующий воркер op 13 (флаг '_auto_update'=False). Раньше
+            # сохранение делалось здесь же, но при повторном запуске
+            # цепочки в config оставались устаревшие '_auto_rows' из
+            # прошлого прогона — воркер op 13 сохранял пустой/старый план,
+            # Update запускался с plan.xml от предыдущей операции и падал
+            # на именах файлов из старого сценария («boot_..._r.bin не
+            # найден»). Разделение шагов гарантирует, что plan.xml всегда
+            # пересобирается из актуальных данных.
             self.log(f"Данные для редактора подготовлены. Модулей: "
                      f"{len(modules_info)}, прошивок: {len(firmwares)}")
-            # v1.77: маркер «finished уже эмитирован» — см. выше.
-            self._finished_emitted = True
-            self.finished_signal.emit(True, "СП сохранён (тихий режим)", {
+            self._emit_finished(True, "Данные получены", {
                 "modules_info": modules_info,
                 "plan_modules": plan_modules,
                 "firmwares": firmwares,
                 "action": "edit",
-                "_auto_saved": True,
-                # v1.77: собранные строки СП — цепочке не нужно пересобирать
-                # их в GUI и запускать дополнительный воркер сохранения
-                "_auto_rows": built_rows,
+                # v1.78: маркер цепочки — GUI передаст эти данные воркеру
+                # op 13 (cfg['_auto_data']) вместо сборки строк в GUI
+                "_auto_data_ready": True,
             })
             return
         self.log(f"Данные для редактора подготовлены. Модулей: {len(modules_info)}, прошивок: {len(firmwares)}")
@@ -2091,8 +2133,7 @@ class OperationWorker(QThread):
         # эмитить второй finished («Операция завершена успешно»), иначе
         # диалог результата открывался дважды и строка «--- Операция:
         # Просмотр результата завершена ---» писалась в лог дважды.
-        self._finished_emitted = True
-        self.finished_signal.emit(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result"})
+        self._emit_finished(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result"})
 
     def _op9_edit_plan(self, ssh):
         # Требование v1.66: операция «Редактировать СП» выполняется через
@@ -2174,6 +2215,90 @@ class OperationWorker(QThread):
         self._op6_update(ssh, plan_rows=selected)
         self.progress_signal.emit(100)
 
+    def _auto_build_rows(self, modules_info, plan_modules, firmwares):
+        """v1.78: сборка строк СП тихим автозаполнением appl — БЕЗ GUI и без
+        создания диалога (используется воркером op 13 в цепочке Автопрошивки).
+
+        Логика повторяет EditSPDialog.autofill('apply'): для каждого
+        прошиваемого модуля подбирается самый свежий файл типа appl/full не
+        выбирается; резервы широких модулей и слоты без SN пропускаются."""
+        fw_by_type = {}
+        for fw in firmwares or []:
+            mt = (fw.get("module_type") or "").upper()
+            if mt:
+                fw_by_type.setdefault(mt, []).append(fw)
+        plan_by_slot = {}
+        for m in plan_modules or []:
+            try:
+                plan_by_slot[str(int(str(m.get('slot', '')).strip()))] = m
+            except (TypeError, ValueError):
+                continue
+
+        def ver_key(fw):
+            v = fw.get('version', '0') or '0'
+            m = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', v)
+            if m:
+                return tuple(int(x or 0) for x in m.groups())
+            return (0, 0, 0)
+
+        rows = []
+        for info in modules_info:
+            slot = str(info['slot_num'])
+            plan = plan_by_slot.get(slot, {})
+            flashable = info.get(
+                'flashable', info.get('serial_num', 'N/A') != 'N/A')
+            row = {
+                "slot": info['slot_num'],
+                "module_type": info.get('module_type', 'NA'),
+                "device_fw_version": info.get('firmware_version', 'N/A'),
+                "path": plan.get('path', ''),
+                "img_type": normalize_img_type(plan.get('img_type')) or 'apply',
+                "local_fw": None,
+                "flashable": flashable,
+                "unflash_reason": "",
+            }
+            if not flashable:
+                row['path'] = ''
+                rows.append(row)
+                continue
+            mt = str(row['module_type']).upper()
+            candidates = [fw for fw in fw_by_type.get(mt, [])
+                          if self._fw_row_matches(fw, 'apply')]
+            if candidates:
+                best = max(candidates, key=ver_key)
+                rel_path = f"images/{best.get('rel_path', best['filename'])}"
+                row['path'] = rel_path
+                row['local_fw'] = best
+                row['source'] = best.get('source') \
+                    or detect_fw_source(rel_path)
+                row['img_type'] = 'apply'
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _fw_row_matches(fw, want_type):
+        """Мини-аналог EditSPDialog._fw_matches_type для сборки вне GUI."""
+        src = (fw.get('source') or '').lower()
+        if src in ('apply', 'appl'):
+            return want_type == 'apply'
+        if src == 'boot':
+            return want_type == 'boot'
+        if src == 'full':
+            return False
+        prefix = (fw.get('name_prefix') or '').lower()
+        if prefix == 'appl':
+            return want_type == 'apply'
+        if prefix == 'boot':
+            return want_type == 'boot'
+        if prefix == 'full':
+            return False
+        fw_type = (fw.get('fw_type') or '').lower()
+        if fw_type in ('apply', 'appl'):
+            return want_type == 'apply'
+        if fw_type == 'boot':
+            return want_type == 'boot'
+        return False
+
     def _op13_quiet_save(self, ssh=None):
         """v1.73: тихое сохранение собранного СП на устройство.
 
@@ -2227,19 +2352,12 @@ class OperationWorker(QThread):
             except OSError:
                 pass
         self.progress_signal.emit(100)
-        # v1.76: '_auto_saved' — маркер для цепочки Автопрошивки; emit
-        # выполняется только когда метод вызван как самостоятельный воркер
-        # op 13 (обратная совместимость). При вызове из воркера op 11
-        # ('_auto_after_prepare') finished эмитит сам op 11 после метода.
-        if own_conn:
-            # v1.77: маркер «finished уже эмитирован» — см. выше.
-            self._finished_emitted = True
-            self.finished_signal.emit(True, "СП сохранён (тихий режим)", {
-                "_auto_saved": True,
-                # v1.77: строки СП возвращаются цепочке в data — GUI не
-                # пересобирает их и не запускает дополнительный воркер
-                "_auto_rows": rows,
-            })
+        # v1.78: метод больше НЕ эмитит finished — он возвращает собранные
+        # строки СП; единый finished эмитит run() («Операция завершена
+        # успешно»). Раньше двойной emit (из метода и из run()) давал
+        # двойные строки «--- Операция ... завершена ---» и двойной переход
+        # цепочки к следующему шагу (Автопрошивка пропускала шаг/зависала).
+        return selected
 
     @staticmethod
     def _safe_remove(path):
@@ -2357,12 +2475,18 @@ class ViewResultDialog(QDialog):
                 lambda checked=False: on_dump(self))
         else:
             self.dump_btn.setEnabled(False)
-        layout.addWidget(self.dump_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        # v1.78: кнопки «Выгрузить дамп» и «ОК» выровнены по горизонтали в
+        # одном ряду (раньше dump_btn была отдельной строкой слева, а ОК —
+        # ниже справа, визуально не выровнены).
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.dump_btn)
+        btn_row.addStretch()
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         for btn in btn_box.buttons():
             btn.setObjectName("dialog_btn_ok")
         btn_box.accepted.connect(self.accept)
-        layout.addWidget(btn_box)
+        btn_row.addWidget(btn_box)
+        layout.addLayout(btn_row)
 
 
 class EditSPDialog(QDialog):
@@ -3382,7 +3506,14 @@ class MainWindow(QMainWindow):
         color = "#000000"
         font_weight = "normal"
         msg_lower = msg.lower()
-        if "ошибка" in msg_lower or "critical" in msg_lower or "error" in msg_lower:
+        # v1.78: служебные строки операций окрашиваются в первую очередь —
+        # раньше строка «--- Операция: ... завершена с ошибкой ---» попадала
+        # в ветку «ошибка» (красная), а не в синюю ветку служебных строк.
+        if ("--- запущена" in msg_lower or "--- завершена" in msg_lower
+                or "=== автопрошивка" in msg_lower):
+            color = "#003399"
+            font_weight = "bold"
+        elif "ошибка" in msg_lower or "critical" in msg_lower or "error" in msg_lower:
             color = "#b30000"
             font_weight = "bold"
         elif "успешно" in msg_lower or "complete" in msg_lower:
@@ -3390,9 +3521,6 @@ class MainWindow(QMainWindow):
             font_weight = "bold"
         elif "предупреждение" in msg_lower or "warning" in msg_lower:
             color = "#b35900"
-            font_weight = "bold"
-        elif "--- запущена" in msg_lower or "--- завершена" in msg_lower:
-            color = "#003399"
             font_weight = "bold"
         elif "остановка" in msg_lower or "запуск" in msg_lower:
             color = "#444444"
@@ -3449,10 +3577,21 @@ class MainWindow(QMainWindow):
         # шаге 2/6 («Создать СП») с окном «Уже выполняется другая операция»
         # (шаг MakePlan выполняется долго — остановка сервисов + пауза ~15 c,
         # и завершающий его поток ещё не освободился).
+        # v1.78: проверка занятости — если предыдущий воркер ещё запущен, но
+        # уже эмитировал finished (собственный emit в потоке до возврата run():
+        # op 8 «Просмотр результата», тихий редактор op 11), считаем операцию
+        # завершённой и не блокируем запуск. Раньше это давало ложное
+        # «Уже выполняется другая операция» при быстром нажатии следующей
+        # кнопки/шага цепочки.
+        prev_worker_done = False
+        if hasattr(self, "worker") and self.worker is not None \
+                and self.worker.isRunning():
+            prev_worker_done = bool(
+                getattr(self.worker, "_finished_emitted", False))
         if not getattr(self, "_auto_step", 0):
-            if getattr(self, "_ops_busy", False) or (
+            if (getattr(self, "_ops_busy", False) or (
                     hasattr(self, "worker") and self.worker is not None
-                    and self.worker.isRunning()):
+                    and self.worker.isRunning() and not prev_worker_done)):
                 QMessageBox.warning(self, "Внимание",
                                     "Уже выполняется другая операция. "
                                     "Дождитесь её завершения.")
@@ -3525,6 +3664,13 @@ class MainWindow(QMainWindow):
         # v1.73: при старте цепочки сразу запускаем шаг 1 (воркер не
         # создаётся — реальную работу выполняют шаги 1..6)
         if op_id == 13 and getattr(self, "_auto_step", 0) <= 1:
+            # v1.78: старт цепочки — сбрасываем состояние предыдущих прогонов
+            # (в т.ч. '_auto_failed': при залипшем флаге шаг 6 «очистки»
+            # завершал цепочку сразу после шага 1 и Автопрошивка выглядела
+            # зависшей).
+            self._auto_failed = False
+            self._auto_failed_step = None
+            self._auto_rows = None
             self._auto_step = 1
             self._auto_run_step()
             return
@@ -3545,7 +3691,21 @@ class MainWindow(QMainWindow):
         quiet = in_auto_chain
         worker_op = op_id
         if op_id == 13 and in_auto_chain:
-            cfg['_auto_rows'] = getattr(self, "_auto_rows", None) or []
+            # v1.78: строки СП для шага 4 берутся из self._auto_rows (их
+            # вернул воркер шага 3 в finished data); для шага 3 строки ещё
+            # не собраны — передаём данные редактора ('_auto_data'), из
+            # которых воркер op 13 соберёт их сам тихим автозаполнением.
+            if getattr(self, "_auto_pass_data_to_next", False):
+                # v1.78: переход 3->4 — передаём воркеру данные редактора
+                # (он соберёт строки автозаполнением и сохранит plan.xml)
+                cfg['_auto_rows'] = []
+                cfg['_auto_data'] = getattr(self, "_auto_data", None) or {}
+                self._auto_pass_data_to_next = False
+            elif self._auto_step == 4:
+                cfg['_auto_rows'] = getattr(self, "_auto_rows", None) or []
+            else:
+                cfg['_auto_rows'] = []
+                cfg['_auto_data'] = getattr(self, "_auto_data", None) or {}
             # Шаг 4 цепочки — запись plan.xml + Update; шаг 3 — тихое
             # сохранение СП без SSH-потока (данные подготовлены на шаге 3).
             cfg['_auto_update'] = (self._auto_step == 4)
@@ -3647,46 +3807,37 @@ class MainWindow(QMainWindow):
                 self._auto_finish()
             return
         if step == 3:
-            # v1.77: весь шаг 3 (тихий редактор) выполняется ОДНИМ воркером
-            # op 11: подготовка данных + сборка строк СП автозаполнением
-            # appl + сохранение plan.xml на устройство — внутри фонового
-            # потока, до возврата run(). Раньше этап A делался в GUI и для
-            # сохранения запускался второй воркер из обработчика
-            # finished-сигнала — он стартовал, пока первый поток ещё был
-            # запущен (isRunning()==True), start_operation отвечал «Уже
-            # выполняется другая операция» и цепочка зависала на шаге 2/6→3.
-            if data.get("_auto_saved"):
-                self._auto_rows = data.get("_auto_rows") or []
+            # v1.78: воркер op 11 вернул данные редактора
+            # ('_auto_data_ready'); сборка строк СП тихим автозаполнением
+            # appl и сохранение plan.xml выполняются следующим воркером
+            # op 13 (_auto_update=False) — без создания диалога в GUI и
+            # без устаревших '_auto_rows' прошлых прогонов.
+            if data.get("_auto_data_ready"):
+                self._auto_data = {
+                    "modules_info": data.get("modules_info") or [],
+                    "plan_modules": data.get("plan_modules") or [],
+                    "firmwares": data.get("firmwares") or [],
+                }
+                self._auto_rows = None
+                # v1.78: следующий шаг цепочки (4) тоже запускается через
+                # op 13, но ему нужны данные шага 3 ('_auto_data'); при
+                # переходе 3->4 self._auto_step уже равен 4, поэтому
+                # временный флаг говорит start_operation передать данные.
+                self._auto_pass_data_to_next = True
                 self._auto_step += 1
-                self._auto_run_step()
+                try:
+                    self._auto_run_step()
+                except Exception as e:
+                    self._auto_abort(f"Ошибка запуска тихого сохранения СП: {e}")
                 return
-            try:
-                dialog = EditSPDialog(
-                    data["modules_info"], data["plan_modules"],
-                    data["firmwares"], self.get_current_config(), self,
-                    quiet=True)
-                dialog.autofill("apply")
-                rows = [dict(r) for r in dialog.rows]
-                for i, r in enumerate(rows):
-                    r['path'] = dialog.path_edits[i].text().strip()
-                    r['img_type'] = dialog.type_combos[i].currentData()
-                del dialog
-                if not any(r.get('path') and r.get('flashable', True)
-                           for r in rows):
-                    raise Exception("Автопрошивка: автозаполнение appl не "
-                                    "выбрало ни одного модуля — "
-                                    "прошивать нечего")
-                self._auto_rows = rows
-            except Exception as e:
-                self._auto_abort(f"Ошибка тихого редактирования СП: {e}")
-                return
-            # Ветка больше не используется (v1.77): сохранение СП выполняется
-            # тем же воркером op 11; оставлен безопасный выход — если по
-            # какой-то причине '_auto_saved' не проставлен, цепочка
-            # продолжает работу без зависания.
-            self._auto_step += 1
-            self._auto_run_step()
-            return
+            self._auto_abort("Автопрошивка: шаг 3 не вернул данные "
+                             "редактора СП")
+        # v1.78: шаг 3b (тихое сохранение plan.xml, воркер op 13) —
+        # обработчик общего перехода ниже поймал бы его как шаг 4 и ушёл
+        # к прошивке с пустыми строками; здесь фиксируем строки СП и
+        # продолжаем обычным порядком (шаг 4 = Update).
+        if data.get("_auto_saved"):
+            self._auto_rows = data.get("_auto_rows") or []
         # Шаги 1, 2, 4, 5 — переход к следующему
         if step == 5 and success:
             # результат показан в диалоге — затем очистка
@@ -3799,7 +3950,8 @@ class MainWindow(QMainWindow):
             # уже сохранён на устройство воркером op 11 ('_auto_saved');
             # обработка перехода к прошивке выполняется в
             # _auto_flash_step_done, диалог редактора НЕ открывается.
-            if getattr(self, "_auto_step", 0) > 0 and data.get("_auto_saved"):
+            if getattr(self, "_auto_step", 0) > 0 and (
+                    data.get("_auto_saved") or data.get("_auto_data_ready")):
                 return
             # v1.77: если редактирование СП было запущено сразу после
             # «Создать СП» (_pending_make_plan), открываем редактор без
