@@ -1,16 +1,22 @@
 name: Build Windows EXE
 
 # Сборка .exe через PyInstaller на windows-latest.
-# 1) Ручной запуск (Actions -> Build Windows EXE -> Run workflow): артефакт dist-экземпляр.
-# 2) Push тега vX.Y.Z: сборка + автоматический релиз GitHub с вложенным .exe.
+# 1) Ручной запуск (Actions -> Build Windows EXE -> Run workflow): артефакт;
+#    если заполнен input `tag` — дополнительно публикация в релиз этого тега.
+# 2) Push тега vX.Y.Z: сборка + публикация релиза GitHub с вложенным .exe.
 #
-# Права: contents:write нужен action-у для загрузки ассета в релиз;
-# generate_release_notes требует разрешений в Settings -> Actions -> General
-# ("Read and write permissions"), поэтому при их отсутствии используется
-# запасной способ создания релиза через REST API (token GITHUB_TOKEN).
+# ВАЖНО: публикация ассетов выполняется отдельным job на ubuntu-latest.
+# Причина: windows-latest нестабильно догружал ассеты — релиз создавался,
+# но browser_download_url отдавал 404 (проверено на v1.73). На ubuntu
+# прямая загрузка curl к uploads.github.com работает стабильно.
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для публикации в релиз (пусто = только артефакт)'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -64,80 +70,85 @@ jobs:
           test -f "dist/${{ steps.ver.outputs.exe }}"
           ls -la dist/
 
-      - name: Загрузка артефакта (для ручного запуска)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Загрузка артефакта exe
         uses: actions/upload-artifact@v4
         with:
           name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
           path: dist/${{ steps.ver.outputs.exe }}
           if-no-files-found: error
 
-      - name: Публикация релиза и загрузка .exe (официальный gh + ретраи)
-        if: startsWith(github.ref, 'refs/tags/v')
-        # История проблемы: ассеты создавались, но browser_download_url отдавал
-        # 404 (файл не догружался до хранилища GitHub). Решение: официальный
-        # GitHub CLI (gh release upload) с ретраями и принудительной проверкой
-        # доступности; при неудаче — запасной путь через REST uploads.github.com.
-        shell: bash
+  publish-release:
+    name: Публикация exe в релиз (Ubuntu)
+    needs: build-windows
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Определение тега
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Скачивание артефакта сборки
+        uses: actions/download-artifact@v4
+        with:
+          pattern: MFC_Flasher_v*-windows
+          run-id: ${{ needs.build-windows.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: exe
+          merge-multiple: true
+
+      - name: Создание релиза и загрузка .exe (curl, ретраи, проверка доступности)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
           REPO: ${{ github.repository }}
-          EXE: ${{ steps.ver.outputs.exe }}
         run: |
           set -uo pipefail
-          BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
-          URL="https://github.com/$REPO/releases/download/$TAG/$EXE"
-          check() { local c; c=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL"); [ "$c" = "206" ] || [ "$c" = "200" ]; }
-          # 1) Релиз по тегу (создать, если нет)
-          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "MFC_Flasher $TAG" --notes "$BODY" || true
-          fi
-          # 2) Загрузка ассета официальным gh с ретраями (до 5 попыток)
-          for i in 1 2 3 4 5; do
-            echo "== Попытка $i: gh release upload =="
-            gh release upload "$TAG" "dist/$EXE" --repo "$REPO" --clobber || true
-            for s in 1 2 3 4 5 6; do
-              sleep 10
-              if check; then
-                echo "Ассет доступен: $URL"
-                echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-            done
-            echo "Ассет ещё не доступен (догрузка/кэш CDN)..."
-          done
-          # 3) Запасной путь: прямой REST uploads.github.com
-          echo "== Все попытки gh исчерпаны — пробую REST =="
-          API="https://api.github.com/repos/$REPO/releases"
+          EXE=$(ls exe/*.exe | head -1)
+          NAME=$(basename "$EXE")
+          API="https://api.github.com/repos/$REPO"
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          RID=$(curl -s "${AUTH[@]}" "$API/tags/$TAG" | python -c "import json,sys,re; d=json.load(sys.stdin); rid=d.get('id'); print(rid if rid else (re.search(r'/releases/(\\d+)', d.get('url','')).group(1) if d.get('url') and re.search(r'/releases/(\\d+)', d.get('url','')) else ''))" 2>/dev/null || true)
-          [ -z "$RID" ] && { echo "::error::Нет релиза для $TAG"; exit 1; }
-          AID=$(curl -s "${AUTH[@]}" "$API/$RID/assets" | python -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$EXE']; print(a[0]['id'] if a else '')")
-          if [ -n "$AID" ]; then curl -s -X DELETE "${AUTH[@]}" "https://api.github.com/repos/$REPO/releases/assets/$AID" >/dev/null || true; fi
-          SIZE=$(wc -c < "dist/$EXE")
-          HTTP=$(curl -s -o rest_asset.json -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            -H "Content-Length: $SIZE" \
-            --data-binary "@dist/$EXE" \
-            "$API/$RID/assets?name=$EXE")
-          echo "REST загрузка: HTTP $HTTP"
-          [ "$HTTP" = "201" ] || exit 1
-          for s in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            sleep 10
-            if check; then
-              echo "Ассет доступен (REST): $URL"
-              echo "### Скачать: [$EXE]($URL)" >> "$GITHUB_STEP_SUMMARY"
+          BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
+          # 1) релиз по тегу (если ещё нет)
+          RID=$(curl -s "${AUTH[@]}" "$API/releases/tags/$TAG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" || true)
+          if [ -z "$RID" ]; then
+            RID=$(curl -s "${AUTH[@]}" -X POST "$API/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+          fi
+          [ -n "$RID" ] || { echo "::error::Не удалось создать/найти релиз $TAG"; exit 1; }
+          # 2) удалить старый ассет с таким именем (если есть битый)
+          AID=$(curl -s "${AUTH[@]}" "$API/releases/$RID/assets" | python3 -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$NAME']; print(a[0]['id'] if a else '')")
+          if [ -n "$AID" ]; then curl -s -X DELETE "${AUTH[@]}" "$API/releases/assets/$AID" >/dev/null || true; fi
+          # 3) загрузка с ретраями
+          OK=0
+          for i in 1 2 3 4 5; do
+            echo "== Попытка $i: загрузка $NAME =="
+            CODE=$(curl -s -o /tmp/up.json -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$EXE" \
+              "https://uploads.github.com/repos/$REPO/releases/$RID/assets?name=$NAME")
+            echo "HTTP $CODE"; head -c 300 /tmp/up.json; echo
+            if [ "$CODE" = "201" ]; then OK=1; break; fi
+            sleep 15
+          done
+          [ "$OK" = "1" ] || { echo "::error::Загрузка ассета не удалась"; exit 1; }
+          # 4) проверка доступности скачивания
+          URL="https://github.com/$REPO/releases/download/$TAG/$NAME"
+          for s in $(seq 1 12); do
+            sleep 5
+            C=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
+            if [ "$C" = "206" ] || [ "$C" = "200" ]; then
+              echo "Ассет доступен: $URL"
+              echo "### Скачать: [$NAME]($URL)" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           done
-          echo "::error::Ассет так и не стал доступен по $URL"; exit 1
-
-      - name: Артефакт и для сборки по тегу (резервная копия exe)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
-          path: dist/${{ steps.ver.outputs.exe }}
-          if-no-files-found: error
+          echo "::warning::Ассет загружен, но URL пока недоступен (кэш CDN): $URL"
