@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.85"
+APP_VERSION = "1.86"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -1037,6 +1037,10 @@ class OperationWorker(QThread):
                 # шивки boot_..._r.bin не найден», хотя в plan.xml были дру-
                 # гие имена.
                 self._op6_update(ssh)
+                # v1.86: хвост операции Update — единый finished с данными
+                # результата (диалог показывается и в ручном режиме, и в
+                # цепочке Автопрошивки шаг 4).
+                self._op13_auto_flash_tail(ssh)
             elif self.op_id == 7:
                 self._op7_download_dump(ssh)
             elif self.op_id == 8:
@@ -1786,6 +1790,10 @@ class OperationWorker(QThread):
             self._emit_finished(True, "СП сохранён (тихий режим)", {
                 "_auto_saved": True,
                 "_auto_rows": selected or [],
+                # v1.86: сохраняем собранный план в config — шаг 4 цепочки
+                # (Update) берёт из него строки для диалога результата и
+                # отчёта «версия до → после» (config общий для всех шагов).
+                "_auto_rows_cfg": selected or [],
             })
             return
         # v1.79: весь шаг 3 цепочки — ОДИН воркер op 11 (см. выше): строки СП
@@ -2095,6 +2103,11 @@ class OperationWorker(QThread):
             stdin, stdout, stderr = ssh.client.exec_command("cat /home/user/fw_update/result.txt")
             result_content = stdout.read().decode()
             results = parse_result_txt(result_content)
+            # v1.86: дата/время окончания прошивки — фиксируется здесь и
+            # передаётся в диалог результата через _op13_auto_flash_tail
+            # (раньше в Автопрошивке диалог открывался без flash_dt —
+            # «Дата/время прошивки не определена»).
+            update_finished_ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             # v1.81: локальная копия result.txt — чтобы результат можно было
             # посмотреть и после удаления директории агента с контроллера
             # (шаг 6 Автопрошивки). Копия пишется в директорию агента на ПК.
@@ -2151,6 +2164,26 @@ class OperationWorker(QThread):
                              f"{_short_fw_ver(to_ver)})")
                 else:
                     self.log(f"Слот {slot}: ОШИБКА ПРОШИВКИ - {status}")
+            # v1.86: единый источник данных для диалога результата — слоты
+            # из плана СП (порядок строк plan.xml), версии до/после,
+            # дата/время окончания Update.
+            dialog_modules = []
+            for mod_slot in plan_slots:
+                mrow = next((m for m in (self._last_plan_modules or [])
+                             if str(m.get('slot')) == str(mod_slot)), None)
+                dialog_modules.append({
+                    "slot": str(mod_slot),
+                    "type": (mrow or {}).get('module_type', 'N/A'),
+                    "path": (mrow or {}).get('path', ''),
+                    "img_type": (mrow or {}).get('img_type', 'apply'),
+                })
+            upd_versions = {}
+            for s in map(str, plan_slots):
+                to_v = (parse_firmware_filename(
+                        fw_names_by_slot.get(s, ""))
+                        or {}).get('version')
+                upd_versions[s] = (old_versions.get(s) or "N/A",
+                                   to_v or "N/A")
             summary = f"Итог result.txt: успешно {len(ok_slots)}"
             if err_slots:
                 summary += (", с ошибками " + str(len(err_slots)) + " (слоты: "
@@ -2179,6 +2212,14 @@ class OperationWorker(QThread):
             raise
         finally:
             self._start_services(ssh)
+        # v1.86: результат Update передаётся дальше (_op13_auto_flash_tail).
+        # При исключении выше сюда поток не доходит (общий обработчик run()).
+        self._update_finish_payload = {
+            "modules": dialog_modules,
+            "results": results,
+            "versions": upd_versions,
+            "flash_dt": update_finished_ts,
+        }
 
     def _op7_download_dump(self, ssh):
         # v1.71: отсутствующий дамп — не критическая ошибка
@@ -2253,8 +2294,23 @@ class OperationWorker(QThread):
             elif slot not in results:
                 results[slot] = "__NO_INFO__"
         self.progress_signal.emit(100)
+        # v1.86: столбец «Версии (до → после)» и для ручного «Просмотр
+        # результата»: версии ДО — из глобального кэша (обновляется
+        # операциями «Информация о модулях» / подготовкой редактора СП),
+        # версии ПОСЛЕ — из имён файлов прошивок плана (парсер без HTTP —
+        # сервисы во время просмотра могут быть остановлены).
+        versions = {}
+        # v1.86: кэш классовый (MainWindow._old_versions_cache) — обновляется
+        # операциями «Информация о модулях» и подготовкой редактора СП.
+        old_cache = MainWindow._old_versions_cache or {}
+        for mod in modules:
+            slot = str(mod.get("slot"))
+            to_ver = parse_firmware_filename(
+                os.path.basename(mod.get("path", "") or "")) or {}
+            versions[slot] = (old_cache.get(slot) or "N/A",
+                              to_ver.get("version") or "N/A")
         # v1.81: дата/время прошивки передаются в диалог результата.
-        self._emit_finished(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result", "flash_dt": flash_dt})
+        self._emit_finished(True, "Просмотр результата", {"modules": modules, "results": results, "action": "result", "flash_dt": flash_dt, "versions": versions})
 
     def _op9_edit_plan(self, ssh):
         # Требование v1.66: операция «Редактировать СП» выполняется через
@@ -2415,6 +2471,17 @@ class OperationWorker(QThread):
         # цепочки к следующему шагу (Автопрошивка пропускала шаг/зависала).
         return selected
 
+    def _op13_auto_flash_tail(self, ssh):
+        """v1.86: завершение Update — единый finished с результатом.
+
+        Данные готовит _op6_update (модули из актуального plan.xml, статусы
+        result.txt, версии до/после, дата/время окончания прошивки)."""
+        payload = getattr(self, "_update_finish_payload", None) or {}
+        data = {"action": "result", "flash_dt": "", "versions": {},
+                "modules": [], "results": {}}
+        data.update(payload)
+        self._emit_finished(True, "Прошивка выполнена", data)
+
     @staticmethod
     def _safe_remove(path):
         try:
@@ -2484,31 +2551,45 @@ class ViewResultDialog(QDialog):
     # диалог (требование заказчика). Запуск операции выполняет колбэк,
     # переданный главным окном (worker-операция 7).
     def __init__(self, modules, results, parent=None, on_dump=None,
-                 flash_dt=""):
+                 flash_dt="", versions=None):
         super().__init__(parent)
         self.setWindowTitle("Результат прошивки")
-        self.resize(750, 450)
+        # v1.86: шестой столбец «Версии (до → после)» — ширина окна увеличена
+        self.resize(980, 450)
         layout = QVBoxLayout(self)
         # v1.81: дата/время осуществления прошивки — заголовок над таблицей.
         dt_label = QLabel(f"Дата/время прошивки: {flash_dt or 'не определена'}")
         dt_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(dt_label)
+        # v1.86: добавлен столбец «Версии (до → после)»; статус "Complete"
+        # отображается как «Выполнено» (требование пользователя).
         table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Номер слота", "Тип модуля", "Путь к файлу", "Тип прошивки", "Результат"])
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Номер слота", "Тип модуля", "Путь к файлу", "Тип прошивки", "Версии (до \u2192 после)", "Результат"])
         table.setRowCount(len(modules))
         for i, mod in enumerate(modules):
             table.setItem(i, 0, QTableWidgetItem(mod['slot']))
             table.setItem(i, 1, QTableWidgetItem(mod['type']))
             table.setItem(i, 2, QTableWidgetItem(mod['path']))
             # Внутренний тип 'apply' отображается как 'appl' (как в plan.xml)
-            img_type_item = "appl" if mod['img_type'] == "apply" else mod['img_type']
+            img_type_item = display_img_type(mod['img_type'])
             table.setItem(i, 3, QTableWidgetItem(img_type_item))
+            # v1.86: версия до → после (из payload Update; при просмотре с
+            # устройства без данных Update — «N/A → N/A»)
+            ver_pair = (versions or {}).get(str(mod['slot']))
+            if ver_pair:
+                ver_text = (f"{_short_fw_ver(ver_pair[0])} \u2192 "
+                            f"{_short_fw_ver(ver_pair[1])}")
+            else:
+                ver_text = "N/A \u2192 N/A"
+            table.setItem(i, 4, QTableWidgetItem(ver_text))
             res_raw = results.get(mod['slot'], "__NO_INFO__")
             if res_raw == "__NO_INFO__":
                 res = "Нет информации"
             elif "Complete" in res_raw:
-                res = res_raw
+                # v1.86: по требованию — вместо внутреннего "Complete"
+                # показываем «Выполнено»
+                res = "Выполнено"
             else:
                 res = res_raw if res_raw.startswith("Ошибка") else f"Ошибка: {res_raw}"
             item = QTableWidgetItem(res)
@@ -2518,7 +2599,7 @@ class ViewResultDialog(QDialog):
                 item.setForeground(QColor("#b30000"))
             else:
                 item.setForeground(QColor("#006600"))
-            table.setItem(i, 4, item)
+            table.setItem(i, 5, item)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -2526,6 +2607,7 @@ class ViewResultDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         table.resizeRowsToContents()
         layout.addWidget(table)
         # v1.75: кнопка «Выгрузить дамп» — перенесена в диалог из главной формы
@@ -2977,8 +3059,13 @@ class EditSPDialog(QDialog):
                 wants_checked = cb.isChecked()
             else:
                 wants_checked = self._is_selectable(idx)
-            # v1.71: пустой путь — выбор снят и чекбокс неактивен
-            cb.setEnabled(not path_empty)
+            # v1.86 (требование): пустой путь — выбор снят, но чекбокс
+            # остаётся АКТИВНЫМ (можно выбрать вручную после заполнения
+            # поля). Раньше setEnabled(not path_empty) делал строку
+            # некликабельной: «Выбрать все»/«Снять все» для таких строк
+            # ничего не меняли («кнопки не работают», флаги «снимались не
+            # с первого нажатия»).
+            cb.setEnabled(True)
             if cb.isChecked() != wants_checked:
                 cb.blockSignals(True)
                 cb.setChecked(wants_checked)
@@ -3880,8 +3967,6 @@ class MainWindow(QMainWindow):
                 "контроллера. Продолжить?",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
             if reply == QMessageBox.StandardButton.Cancel:
-                self._auto_finish(getattr(self, "_auto_failed_step", None)) \
-                    if getattr(self, "_auto_step", 0) else None
                 return
         elif op_id == 13:
             # v1.73: Автопрошивка — предварительная проверка конфигурации
@@ -3980,20 +4065,22 @@ class MainWindow(QMainWindow):
     # На любом сбое — причина в оперативном логе и попытка удалить
     # директорию агента (шаг 6 выполняется даже при ошибке).
     # ---------------------------------------------------------------
+    # v1.86: шаг «Удалить агента и прошивки» из цепочки убран (по
+    # требованию) — директория на контроллере сохраняется; удаление —
+    # отдельная кнопка «Удалить агента». Цепочка: 4 шага.
     AUTO_STEPS = {
         1: "Внедрить агента и прошивки",
         2: "Создать СП",
-        3: "Редактировать СП (тихий режим)",
+        3: "Редактор СП (тихое автозаполнение appl)",
         4: "Запустить прошивку",
-        5: "Просмотр результата",
-        6: "Удалить агента и прошивки",
     }
 
     def _auto_run_step(self):
         """Запускает очередной шаг цепочки Автопрошивки через start_operation."""
         step = self._auto_step
         name = self.AUTO_STEPS.get(step, "")
-        self.append_log(f"[Автопрошивка] Шаг {step}/6: {name}")
+        self.append_log(f"[Автопрошивка] Шаг {step}/{len(self.AUTO_STEPS)}: "
+                        f"{name}")
         # v1.80: шаг 3 (тихий редактор) — воркер op 13: получает информацию о
         # модулях по HTTP, собирает строки СП тихим автозаполнением appl и
         # сохраняет plan.xml на устройство в одном потоке (emit '_auto_saved');
@@ -4001,7 +4088,10 @@ class MainWindow(QMainWindow):
         # раньше шаг 3 шли через op 11 с флагом '_auto_after_prepare', который
         # GUI никогда не передавал, — цепочка падала со «шаг 3 не вернул
         # данные редактора СП».
-        op_map = {1: 1, 2: 2, 3: 11, 4: 6, 5: 8, 6: 12}
+        # v1.86: отдельный шаг «Просмотр результата» (op 8) из цепочки
+        # убран — данные результата приходят вместе с завершением шага 4
+        # (Update эмитит action="result"), GUI откроет диалог сам.
+        op_map = {1: 1, 2: 2, 3: 11, 4: 6}
         self.start_operation(op_map[step])
 
     def _auto_finish(self, reason=None):
@@ -4015,33 +4105,24 @@ class MainWindow(QMainWindow):
             self.append_log("=== АВТОПРОШИВКА ЗАВЕРШЕНА УСПЕШНО ===")
 
     def _auto_abort(self, reason):
-        """Сбой шага: фиксируем причину и пытаемся удалить директорию агента."""
+        """v1.86: сбой шага — причина в логе, цепочка прерывается.
+        Директория агента на контроллере НЕ удаляется (шаг очистки убран
+        из цепочки по требованию пользователя)."""
         self._auto_failed = True
         self.append_log(f"[Автопрошивка] СБОЙ: {reason}")
         QMessageBox.critical(self, "Автопрошивка", f"Сбой: {reason}")
-        self._auto_step = 6  # попытка очистки best-effort
-        self._auto_failed_step = reason
-        try:
-            self._auto_run_step()
-        except Exception as e:
-            self._auto_finish(f"{reason} (очистка не выполнена: {e})")
+        self._auto_finish(reason)
 
     def _auto_flash_step_done(self, success, message, data):
         """Обработка завершения одного шага Автопрошивки."""
         step = self._auto_step
-        if not success and step != 6:
+        if not success:
             self._auto_abort(message or f"ошибка на шаге {step}")
             return
-        if step == 6:
-            # Очистка — финальный шаг цепочки (успех или best-effort)
-            if self._auto_failed:
-                self._auto_finish(getattr(self, "_auto_failed_step", None))
-            else:
-                if not success:
-                    self.append_log("[Автопрошивка] ВНИМАНИЕ: директорию "
-                                    "агента удалить не удалось — выполните "
-                                    "«Удалить агента» вручную")
-                self._auto_finish()
+        # v1.86: шаг 4 (Update) — финальный: результат приходит в payload
+        # (action="result"), диалог откроет _handle_operation_result.
+        if step >= 4:
+            self._auto_finish()
             return
         if step == 3:
             # v1.83: воркер op 11 шага 3 получил информацию о модулях, со-
@@ -4050,6 +4131,10 @@ class MainWindow(QMainWindow):
             if data.get("_auto_saved"):
                 self._auto_rows = data.get("_auto_rows") or []
                 self._auto_data = None
+                # v1.86: собранные строки СП кладём в config — Update (шаг 4)
+                # использует их для диалога результата и отчёта версий.
+                if isinstance(getattr(self, "config", None), dict):
+                    self.config["_auto_rows"] = list(self._auto_rows)
                 if not self._auto_rows:
                     self._auto_abort("Автопрошивка: тихий редактор не "
                                      "выбрал ни одного модуля")
@@ -4154,13 +4239,22 @@ class MainWindow(QMainWindow):
         # доходит до выхода), он НЕ блокирует новую операцию — раньше это
         # давало «Уже выполняется другая операция» при нажатии
         # «Выгрузить дамп» сразу после открытия диалога результата.
+        # v1.86: диагностика блокировки пишется в оперативный лог — видно,
+        # что именно держит утилиту занятой (_ops_busy / живой worker).
+        # Дополнительно: если предыдущий воркер формально ещё жив, но уже
+        # эмитировал finished (op 8 завершается emit'ом внутри run()), он не
+        # блокирует выгрузку дампа (prev_worker_done ниже).
         prev_worker_done = False
         if self.worker is not None and self.worker.isRunning():
             prev_worker_done = bool(
                 getattr(self.worker, "_finished_emitted", False))
-        if getattr(self, "_ops_busy", False) or (
-                self.worker is not None and self.worker.isRunning()
-                and not prev_worker_done):
+        busy_ops = getattr(self, "_ops_busy", False)
+        busy_worker = (self.worker is not None and self.worker.isRunning()
+                       and not prev_worker_done)
+        if busy_ops or busy_worker:
+            self.append_log(
+                f"[Диагностика] Блокировка запуска op 7 (выгрузка дампа): "
+                f"_ops_busy={busy_ops}, worker_занят={busy_worker}")
             QMessageBox.warning(self, "Внимание",
                                 "Уже выполняется другая операция. "
                                 "Дождитесь её завершения.")
@@ -4178,6 +4272,16 @@ class MainWindow(QMainWindow):
         # пр.) больше не «закрывает» программу — необработанные исключения
         # Qt-слотов перехватываются глобальным excepthook (v1.67), но без
         # try/except здесь кнопки операций оставались заблокированными.
+        # v1.86: запоминаем данные результата («Просмотр результата») —
+        # чтобы «Выгрузить дамп» из диалога можно было запустить даже, если
+        # worker ещё числится живым, и для повторного открытия диалога.
+        if isinstance(data, dict) and data.get("action") == "result":
+            self._last_result_data = {
+                "modules": data.get("modules", []),
+                "results": data.get("results", {}),
+                "flash_dt": data.get("flash_dt", ""),
+                "versions": data.get("versions", {}),
+            }
         try:
             self._handle_operation_result_impl(success, message, data)
         except Exception as e:
@@ -4205,7 +4309,8 @@ class MainWindow(QMainWindow):
             dialog = ViewResultDialog(
                 modules, results, self,
                 on_dump=lambda d, m=modules, r=results:
-                self._start_dump_from_dialog(d, m, r))
+                self._start_dump_from_dialog(d, m, r),
+                versions=data.get("versions") or {})
             dialog.exec()
             return
         if reopen is not None and not success:
@@ -4230,7 +4335,9 @@ class MainWindow(QMainWindow):
             dialog = ViewResultDialog(
                 data["modules"], data["results"], self,
                 on_dump=lambda d, m=data["modules"], r=data["results"]:
-                self._start_dump_from_dialog(d, m, r))
+                self._start_dump_from_dialog(d, m, r),
+                flash_dt=data.get("flash_dt", ""),
+                versions=data.get("versions") or {})
             dialog.exec()
         elif action == "edit":
             # v1.76: шаг 3 цепочки Автопрошивки — данные подготовлены и СП
@@ -4256,6 +4363,13 @@ class MainWindow(QMainWindow):
                 on_log=self.append_log
             )
             self._auto_edit_dialog = dialog
+            # v1.86 (требование): при открытии редактора СП автоматически
+            # выполняется автозаполнение appl (пути подбираются по типам
+            # модулей, выбор выставляется по правилам select_all). В тихом
+            # режиме цепочки автозаполнение уже выполнено воркером — не
+            # повторяем.
+            if getattr(self, "_auto_step", 0) == 0:
+                dialog.autofill("apply")
             dialog.exec()
             # v1.77: данные для редактора уже загружены воркером op 11 —
             # повторный запуск операции 9 (загрузка plan.xml ещё раз) не
