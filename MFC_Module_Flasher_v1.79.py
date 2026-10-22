@@ -970,18 +970,23 @@ class OperationWorker(QThread):
                 self._op11_prepare_edit_plan()
                 return
             if self.op_id == 13 and not self.config.get('_auto_update'):
-                # v1.79: этот путь устарел (шаг 3 цепочки целиком выполняет
-                # воркер op 11 с '_auto_after_prepare' — см. run() выше);
-                # если воркер op 13 без '_auto_update' всё же запустили,
-                # завершаем операцию понятной ошибкой вместо тихого сохранения
-                # plan.xml старыми данными из config (именно так Update раньше
-                # получал план «из предыдущего сценария» и падал на имени
-                # 'boot_atb3500_dor12_r.bin', которого в актуальном плане нет).
-                raise Exception(
-                    "Некорректный запуск тихого сохранения СП: данные шага "
-                    "Автопрошивки устарели. Выполните «Редактировать СП» и "
-                    "«Запустить прошивку» вручную либо перезапустите "
-                    "«Автопрошивку».")
+                # v1.80: тихий редактор шага 3 цепочки выполняется ПРЯМО ЗДЕСЬ
+                # (в этом же потоке) — раньше это делал воркер op 11, но GUI
+                # никогда не передавал ему '_auto_after_prepare', и цепочка
+                # падала со «шаг 3 не вернул данные редактора СП». Теперь
+                # шаг 3: получить информацию о модулях по HTTP (без SSH),
+                # просканировать директорию прошивок, собрать строки тихим
+                # автозаполнением appl и сохранить plan.xml на устройство;
+                # finished эмитится ровно один раз с '_auto_saved'.
+                modules_info = self._fetch_module_info()
+                firmwares = self._scan_firmware_dir()
+                rows = self._auto_build_rows(modules_info, [], firmwares)
+                selected = self._op13_quiet_save(rows=rows)
+                self._emit_finished(True, "СП сохранён (тихий режим)", {
+                    "_auto_saved": True,
+                    "_auto_rows": selected or [],
+                })
+                return
             ssh = SSHClient(self.config['ip'], self.config['password'])
             ssh.connect()
             self.log("Подключение к устройству установлено")
@@ -1012,13 +1017,11 @@ class OperationWorker(QThread):
                 ssh = None
                 self._cleanup_remote_agent()
             elif self.op_id == 13:
-                # v1.79: устаревший путь цепочки (сохранение СП + Update в
-                # одном воркере op 13). Шаг 3 выполняет воркер op 11, шаг 4 —
-                # обычный op 6; сюда цепочка больше не заходит.
+                # v1.80: '_auto_update' — legacy-путь (шаг 3 выполняется
+                # раньше и завершается собственным emit в начале run(), без
+                # SSH); до SSH-блока этот поток не доходит.
                 raise Exception(
-                    "Устаревшая операция Автопрошивки (op 13): используйте "
-                    "«Редактировать СП» + «Запустить прошивку» или "
-                    "перезапустите «Автопрошивку».")
+                    "Некорректный запуск операции Автопрошивки (op 13).")
 
             if ssh is not None:
                 ssh.close()
@@ -3749,20 +3752,31 @@ class MainWindow(QMainWindow):
         cfg = dict(config)
         quiet = in_auto_chain
         worker_op = op_id
-        # v1.79: двухворкерный путь шага 3 (op 11 -> op 13) удалён — весь шаг
-        # выполняет один воркер op 11 ('_auto_after_prepare' + quiet).
+        # v1.80: шаг 3 цепочки — тихий редактор выполняет воркер op 13 (в нём
+        # сборка строк appl-автозаполнением и сохранение plan.xml идут в ОДНОМ
+        # потоке до emit finished). Раньше шаг шли через op 11 с флагом
+        # '_auto_after_prepare', который GUI никогда не устанавливал, — блок в
+        # воркере не выполнялся, данные не возвращались, и цепочка падала со
+        # «шаг 3 не вернул данные редактора СП».
+        if op_id == 13 and getattr(self, "_auto_step", 0) == 3:
+            worker_op = 13
         # Шаг 2 цепочки (MakePlan): локальная проверка агента заменена на
         # удалённую проверку состояния сервисов PrjA/PrjA-tele — агент лежит
         # на контроллере, а не на диске ПК, и раньше шаг 2 падал сразу после
         # старта цепочки («зависание» наблюдалось именно здесь).
         if op_id == 2 and in_auto_chain:
             cfg['_skip_local_checks'] = True
+        # v1.80: блокировка кнопок включаем ДО сброса self.worker — иначе
+        # между присваиванием и start() есть окно, в котором повторный запуск
+        # (или нажатие кнопки) обходил бы защиту от параллельных операций.
+        self._set_ops_enabled(False)
         self.worker = OperationWorker(worker_op, cfg, quiet=quiet,
                                       on_log=self.append_log)
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_operation_finished)
         # v1.66: на время выполнения операции остальные кнопки блокируются
+        # (повторная страховка — см. выше)
         self._set_ops_enabled(False)
         self.worker.start()
 
@@ -3793,12 +3807,14 @@ class MainWindow(QMainWindow):
         step = self._auto_step
         name = self.AUTO_STEPS.get(step, "")
         self.append_log(f"[Автопрошивка] Шаг {step}/6: {name}")
-        # v1.79: шаг 3 (тихий редактор) — воркер op 11 с флагом
-        # '_auto_after_prepare' (сборка строк appl + сохранение plan.xml в
-        # одном потоке); шаг 4 (Update) — обычный воркер op 6, читающий план
-        # с устройства; раньше оба шли через op 13, что допускало прошивку по
-        # устаревшим строкам из config («boot_..._r.bin не найден»).
-        op_map = {1: 1, 2: 2, 3: 11, 4: 6, 5: 8, 6: 12}
+        # v1.80: шаг 3 (тихий редактор) — воркер op 13: получает информацию о
+        # модулях по HTTP, собирает строки СП тихим автозаполнением appl и
+        # сохраняет plan.xml на устройство в одном потоке (emit '_auto_saved');
+        # шаг 4 (Update) — обычный воркер op 6, читающий план с устройства;
+        # раньше шаг 3 шли через op 11 с флагом '_auto_after_prepare', который
+        # GUI никогда не передавал, — цепочка падала со «шаг 3 не вернул
+        # данные редактора СП».
+        op_map = {1: 1, 2: 2, 3: 13, 4: 6, 5: 8, 6: 12}
         self.start_operation(op_map[step])
 
     def _auto_finish(self, reason=None):
