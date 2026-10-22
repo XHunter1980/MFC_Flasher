@@ -1,0 +1,187 @@
+name: Build Windows EXE
+
+# Сборка .exe через PyInstaller на windows-latest.
+# 1) Ручной запуск (Actions -> Build Windows EXE -> Run workflow): артефакт;
+#    если заполнен input `tag` — дополнительно публикация в релиз этого тега.
+# 2) Push тега vX.Y.Z: сборка + публикация релиза GitHub с вложенным .exe.
+#
+# ВАЖНО: публикация ассетов выполняется отдельным job на ubuntu-latest.
+# Причина: windows-latest нестабильно догружал ассеты — релиз создавался,
+# но browser_download_url отдавал 404 (проверено на v1.73). На ubuntu
+# прямая загрузка curl к uploads.github.com работает стабильно.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для публикации в релиз (пусто = только артефакт)'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Сборка MFC_Flasher.exe (Windows)
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установка зависимостей и PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      - name: Определение версии приложения
+        id: ver
+        shell: bash
+        run: |
+          # Версия берётся из константы APP_VERSION в исходнике — она же
+          # попадает в название .exe (требование: версия в имени файла).
+          SRC=$(ls MFC_Module_Flasher_v*.py | sort -V | tail -1)
+          VER=$(python -c "import re,sys; m=re.search(r'APP_VERSION\s*=\s*[\"\x27]([\d.]+)[\"\x27]', open(sys.argv[1],encoding='utf-8').read()); print(m.group(1))" "$SRC")
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "exe=MFC_Flasher_v$VER.exe" >> "$GITHUB_OUTPUT"
+          echo "Собираем $SRC -> MFC_Flasher_v$VER.exe"
+
+      - name: Иконка приложения (сжатие ICO если нужно)
+        shell: bash
+        id: icon
+        run: |
+          # Иконка берётся из корня репозитория (файл MFC_moduleUpd.ico).
+          # PyInstaller принимает только квадратные и корректно объявленные
+          # изображения; нестандартный ico сжимается через Pillow в набор
+          # стандартных размеров. Если Pillow недоступен — используем как есть.
+          ICON=MFC_moduleUpd.ico
+          if [ ! -f "$ICON" ]; then
+            echo "::warning::Файл иконки $ICON не найден — сборка без иконки"
+            echo "icon=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat > make_icon.py <<'PY'
+          from PIL import Image
+          im = Image.open("MFC_moduleUpd.ico")
+          sizes = [(s, s) for s in (16, 32, 48, 64, 128, 256)]
+          im.convert("RGBA").resize((256, 256), Image.LANCZOS).save(
+              "app_icon.ico", sizes=sizes)
+          print("app_icon.ico создан (квадратный, 16..256)")
+          PY
+          python make_icon.py || echo "::warning::Конвертация ICO не удалась — используется оригинал"
+          if [ -f app_icon.ico ]; then
+            echo "icon=app_icon.ico" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=$ICON" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Сборка exe (onefile, без консоли, версия в имени, иконка)
+        shell: bash
+        run: |
+          ICON_FLAG=""
+          if [ -n "${{ steps.icon.outputs.icon }}" ]; then
+            ICON_FLAG="--icon \"${{ steps.icon.outputs.icon }}\" --add-data \"${{ steps.icon.outputs.icon }};.\""
+          fi
+          eval pyinstaller --noconfirm --clean --onefile --windowed \
+            --name "MFC_Flasher_v${{ steps.ver.outputs.version }}" \
+            $ICON_FLAG \
+            "${{ steps.ver.outputs.src }}"
+
+      - name: Проверка результата сборки
+        shell: bash
+        run: |
+          test -f "dist/${{ steps.ver.outputs.exe }}"
+          ls -la dist/
+
+      - name: Загрузка артефакта exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: MFC_Flasher_v${{ steps.ver.outputs.version }}-windows
+          path: dist/${{ steps.ver.outputs.exe }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Публикация exe в релиз (Ubuntu)
+    needs: build-windows
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Определение тега
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Скачивание артефакта сборки
+        uses: actions/download-artifact@v4
+        with:
+          name: MFC_Flasher_v${{ needs.build-windows.outputs.version }}-windows
+          path: exe
+
+      - name: Создание релиза и загрузка .exe (curl, ретраи, проверка доступности)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          EXE=$(ls exe/*.exe | head -1)
+          NAME=$(basename "$EXE")
+          API="https://api.github.com/repos/$REPO"
+          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          BODY="Сборка exe от GitHub Actions. Подробный список изменений — в CHANGELOG.md."
+          # 1) релиз по тегу (если ещё нет)
+          RID=$(curl -s "${AUTH[@]}" "$API/releases/tags/$TAG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" || true)
+          if [ -z "$RID" ]; then
+            RID=$(curl -s "${AUTH[@]}" -X POST "$API/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"MFC_Flasher $TAG\",\"body\":\"$BODY\",\"draft\":false,\"prerelease\":false}" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+          fi
+          [ -n "$RID" ] || { echo "::error::Не удалось создать/найти релиз $TAG"; exit 1; }
+          # 2) удалить старый ассет с таким именем (если есть битый)
+          AID=$(curl -s "${AUTH[@]}" "$API/releases/$RID/assets" | python3 -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['name']=='$NAME']; print(a[0]['id'] if a else '')")
+          if [ -n "$AID" ]; then curl -s -X DELETE "${AUTH[@]}" "$API/releases/assets/$AID" >/dev/null || true; fi
+          # 3) загрузка с ретраями
+          OK=0
+          for i in 1 2 3 4 5; do
+            echo "== Попытка $i: загрузка $NAME =="
+            CODE=$(curl -s -o /tmp/up.json -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$EXE" \
+              "https://uploads.github.com/repos/$REPO/releases/$RID/assets?name=$NAME")
+            echo "HTTP $CODE"; head -c 300 /tmp/up.json; echo
+            if [ "$CODE" = "201" ]; then OK=1; break; fi
+            sleep 15
+          done
+          [ "$OK" = "1" ] || { echo "::error::Загрузка ассета не удалась"; exit 1; }
+          # 4) проверка доступности скачивания
+          URL="https://github.com/$REPO/releases/download/$TAG/$NAME"
+          for s in $(seq 1 12); do
+            sleep 5
+            C=$(curl -s -o /dev/null -w "%{http_code}" -r 0-0 -L "$URL")
+            if [ "$C" = "206" ] || [ "$C" = "200" ]; then
+              echo "Ассет доступен: $URL"
+              echo "### Скачать: [$NAME]($URL)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "::warning::Ассет загружен, но URL пока недоступен (кэш CDN): $URL"
