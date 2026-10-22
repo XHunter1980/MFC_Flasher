@@ -11,16 +11,23 @@ class _Sig:
 class _QThread:
     @staticmethod
     def msleep(x): pass
-qtcore = types.ModuleType("PyQt6.QtCore")
-for n in ("pyqtSignal", "Qt"):
-    setattr(qtcore, n, _Sig)
-qtcore.QThread = _QThread
+
+class _QTimer:
+    @staticmethod
+    def singleShot(ms, fn):  # в тесте тихие шаги не планируются через event loop
+        pass
 
 class _AnyAttrModule(types.ModuleType):
     def __getattr__(self, name):
         if name.startswith("__"):
             raise AttributeError(name)
         return type(name, (), {"__init__": lambda self, *a, **k: None})
+
+qtcore = _AnyAttrModule("PyQt6.QtCore")
+for n in ("pyqtSignal", "Qt"):
+    setattr(qtcore, n, _Sig)
+qtcore.QThread = _QThread
+qtcore.QTimer = _QTimer
 
 qtwidgets = _AnyAttrModule("PyQt6.QtWidgets")
 qtgui = _AnyAttrModule("PyQt6.QtGui")
