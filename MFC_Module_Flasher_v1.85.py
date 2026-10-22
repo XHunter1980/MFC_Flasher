@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.84"
+APP_VERSION = "1.85"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -1594,7 +1594,7 @@ class OperationWorker(QThread):
             reserved = slot in reserved_slots
             if reserved:
                 self.log(f"Слот {slot}: резерв '{module_type}' — прошивка запрещена")
-            result.append({
+            row = {
                 "slot_num": str(slot),
                 "module_type": module_type,
                 "reserved": reserved,
@@ -1606,7 +1606,13 @@ class OperationWorker(QThread):
                 # Модуль доступен для прошивки только если имеет серийный
                 # номер И не является резервом широкого модуля (slot_count>1)
                 "flashable": serial_num != "N/A" and not reserved,
-            })
+            }
+            # v1.85: служебное поле — число слотов креста из ответа бэкенда;
+            # редактор СП по нему ограничивает строки реальными слотами
+            # (защита от IndexError при записях module_arr вне crate_slot_count)
+            if crate_slot_count is not None:
+                row["_crate_slots"] = crate_slot_count
+            result.append(row)
 
         for r in result:
             if self._canon_type(r["module_type"]) in ("", "NA"):
@@ -2581,7 +2587,47 @@ class EditSPDialog(QDialog):
                 return str(int(str(v).strip()))
             except (TypeError, ValueError):
                 return ''
-        plan_by_slot = {_norm_slot(m['slot']): m for m in plan_modules}
+        # v1.85: выборочная защита от некорректных записей плана — раньше
+        # m['slot'] падало с KeyError при записи без атрибута 'slot';
+        # пустые ключи ('' — нечисловой module_slot) не должны перетирать
+        # корректные записи плана тех же слотов
+        plan_by_slot = {}
+        for m in plan_modules or []:
+            if not isinstance(m, dict):
+                continue
+            key = _norm_slot(m.get('slot'))
+            if not key:
+                continue
+            plan_by_slot[key] = m
+        # v1.85: ИСПРАВЛЕНИЕ IndexError: list index out of range — строки
+        # редактора ограничиваются реальными слотами креста (slot_num <=
+        # crate_slot_count). module_arr на реальном контроллере может
+        # содержать записи вне crate_slot_count; их строки раньше
+        # добавлялись в self.rows, а виджеты/ячейки таблицы создавались
+        # только для строк до границы — первый же пересчёт (_is_selectable
+        # -> path_edits[idx]) выходил за границу списка и приложение падало
+        # при открытии редактора СП. Граница берётся из служебного поля
+        # '_crate_slots', которое добавляется в _fetch_module_info (для
+        # старых данных без поля — ограничение не применяется).
+        try:
+            _max_slots = int(modules_info[0].get("_crate_slots")) \
+                if modules_info else None
+        except (TypeError, ValueError, AttributeError):
+            _max_slots = None
+        if _max_slots is not None and _max_slots > 0:
+            _skipped = [mi.get("slot_num") for mi in modules_info
+                        if str(mi.get("slot_num", "")).isdigit()
+                        and int(mi["slot_num"]) > _max_slots]
+            if _skipped:
+                EditSPDialog.log_via(
+                    self._log_cb,
+                    f"Внимание: записи модулей вне слотов креста "
+                    f"(crate_slot_count={_max_slots}) исключены из "
+                    f"редактора: слоты {', '.join(map(str, _skipped))}")
+            modules_info = [
+                mi for mi in modules_info
+                if str(mi.get("slot_num", "")).isdigit()
+                and int(mi["slot_num"]) <= _max_slots]
         self.rows = []
         for info in modules_info:
             slot = info['slot_num']
@@ -2772,6 +2818,9 @@ class EditSPDialog(QDialog):
         одноимённые файлы из разных подпапок), затем по имени файла.
         Заполняет row['local_fw'] и row['source'].
         """
+        # v1.85: страховка от IndexError (рассинхронизация строк/виджетов)
+        if not (0 <= idx < len(self.rows)):
+            return
         row = self.rows[idx]
         path = row.get('path', '')
         filename = os.path.basename(path) if path else ""
@@ -2906,6 +2955,11 @@ class EditSPDialog(QDialog):
         return combo.model()
 
     def _update_row(self, idx):
+        # v1.85: страховка от IndexError (рассинхронизация строк/виджетов)
+        if not (0 <= idx < len(self.rows)) \
+                or idx >= len(self.checkboxes) \
+                or idx >= len(self.path_edits):
+            return
         row = self.rows[idx]
         fw = row.get('local_fw')
 
@@ -3057,6 +3111,12 @@ class EditSPDialog(QDialog):
     def _is_selectable(self, idx):
         """Строка подлежит выбору: модуль прошивается, путь к файлу указан и
         (при включённом контроле формата) файл прошёл проверку формата."""
+        # v1.85: страховка от IndexError — если индекс вышел за пределы
+        # строк/виджетов (рассинхронизация данных и таблицы), строка
+        # считается невыбираемой вместо падения приложения
+        if not (0 <= idx < len(self.rows)) \
+                or idx >= len(self.path_edits):
+            return False
         row = self.rows[idx]
         if not row.get("flashable", True):
             return False
@@ -3157,9 +3217,14 @@ class EditSPDialog(QDialog):
                 ok = self._is_selectable(i)
                 cb.blockSignals(True)
                 if self.rows[i].get("flashable", True):
-                    # чекбокс прошиваемого модуля всегда активен; для строк с
-                    # пустым путём/некорректным форматом выбор просто снят
-                    cb.setEnabled(bool(ok))
+                    # v1.85: чекбокс прошиваемого модуля остаётся АКТИВНЫМ
+                    # всегда — раньше при пустом пути/некорректном формате он
+                    # отключался (setEnabled(False)), и последующее ручное
+                    # включение было невозможно: «Выбрать все» после одного
+                    # нажатия «Снять все» ничего не ставило (кнопки
+                    # «казались нерабочими»). Теперь выбор просто снят, но
+                    # пользователь может отметить строку вручную.
+                    cb.setEnabled(True)
                 cb.setChecked(bool(ok))
                 cb.blockSignals(False)
                 self._update_row(i)
@@ -4109,6 +4174,27 @@ class MainWindow(QMainWindow):
         self.start_operation(7)
 
     def _handle_operation_result(self, success, message, data):
+        # v1.85: падение приложения при открытии редактора СП (IndexError и
+        # пр.) больше не «закрывает» программу — необработанные исключения
+        # Qt-слотов перехватываются глобальным excepthook (v1.67), но без
+        # try/except здесь кнопки операций оставались заблокированными.
+        try:
+            self._handle_operation_result_impl(success, message, data)
+        except Exception as e:
+            text = "".join(traceback.format_exc()).strip()
+            self.append_log(f"Критическая ошибка: {text}")
+            try:
+                QMessageBox.critical(
+                    self, "Ошибка",
+                    f"Не удалось обработать результат операции: {e}\n\n"
+                    f"{text[:1200]}")
+            except Exception:
+                pass
+        finally:
+            if getattr(self, "_auto_step", 0) == 0:
+                self._set_ops_enabled(True)
+
+    def _handle_operation_result_impl(self, success, message, data):
         # v1.75: после успешной выгрузки дампа из диалога «Просмотр
         # результата» — возвращаемся в тот же диалог (он открывался на
         # время операции и закрывался, чтобы не блокировать главный поток).
