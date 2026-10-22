@@ -50,7 +50,7 @@ python MFC_Module_Flasher_v*.py   # актуальная версия, см. APP
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --icon MFC_moduleUpd.ico --add-data "MFC_moduleUpd.ico;." --name "MFC_Flasher_v$(версия)" MFC_Module_Flasher_v1.83.py
+pyinstaller --onefile --windowed --icon MFC_moduleUpd.ico --add-data "MFC_moduleUpd.ico;." --name "MFC_Flasher_v$(версия)" MFC_Module_Flasher_v1.84.py
 ```
 
 ## Конфигурация
@@ -88,7 +88,7 @@ full_<МАРКЕР>_<ТИП>_<...>_R<мажор>.<минор>_<ДДММГГ>.bin
 
 ```
 .
-├── MFC_Module_Flasher_v1.83.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
+├── MFC_Module_Flasher_v1.84.py   # Основное приложение (GUI, SSH/HTTP-клиенты, воркер операций)
 ├── MFC_moduleUpd.ico             # Иконка приложения (встраивается в exe и в окно)
 ├── requirements.txt              # Зависимости
 ├── pyproject.toml                # Конфигурация линтера ruff

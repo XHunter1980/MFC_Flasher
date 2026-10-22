@@ -20,7 +20,7 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Flasher_v1.83.py
+    python MFC_Module_Flasher_v1.84.py
 
 История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
 версию APP_VERSION и добавляйте запись в историю).
@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.83"
+APP_VERSION = "1.84"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -920,6 +920,10 @@ class OperationWorker(QThread):
         # v1.70: два режима операционного лога — краткий (по умолчанию) и
         # подробный (с детализацией). Флаг читается из конфига.
         self.verbose_log = bool(config.get('verbose_log', False))
+        # v1.84: версии модулей «до прошивки» — передаются из глобального
+        # кэша MainWindow (последняя успешная «Информация о модулях»).
+        # Внутри операции Update HTTP-запросов к бэкенду больше нет.
+        self._old_versions = dict(config.get('_old_versions') or {})
         # v1.73: «тихий» режим для Автопрошивки — подавляет диалоговые окна
         # (автозаполнение, предупреждения формата) в EditSPDialog.
         self.quiet = quiet
@@ -1696,6 +1700,11 @@ class OperationWorker(QThread):
 
     def _op10_get_module_info(self):
         modules_data = self._fetch_module_info()
+        # v1.84: каждая успешная «Информация о модулях» обновляет глобальный
+        # кэш версий ДО прошивки — при корректном порядке работы (сначала
+        # информация/СП, потом прошивка) отчёт «с версии X на Y» всегда
+        # актуален и HTTP-запросов внутри остановленных сервисов не требуется.
+        MainWindow.cache_old_versions(self, modules_data)
         self.progress_signal.emit(100)
         # Отладочная сводка: слот -> тип (помогает выявить смещение индексов)
         summary = ", ".join(f"{m['slot_num']}:{m['module_type']}" for m in modules_data)
@@ -1709,6 +1718,9 @@ class OperationWorker(QThread):
 
     def _op11_prepare_edit_plan(self):
         modules_info = self._fetch_module_info()
+        # v1.84: подготовка редактора СП (и тихий шаг 3 Автопрошивки) тоже
+        # обновляет глобальный кэш версий «до прошивки».
+        MainWindow.cache_old_versions(self, modules_info)
         firmwares = self._scan_firmware_dir()
         plan_modules = []
         if not self.quiet:
@@ -1935,16 +1947,11 @@ class OperationWorker(QThread):
             if self.verbose_log:
                 self.log(f"MakePlan stdout: {out}")
             self.log("MakePlan завершён")
-            # v1.81: фиксация версий модулей ДО перепрошивки (для отчёта
-            # «с какой версии на какую» в Автопрошивке). Ошибки HTTP здесь
-            # не критичны — просто не заполним old-версии.
-            try:
-                self._old_versions = {
-                    str(m["slot_num"]): m.get("firmware_version", "")
-                    for m in self._fetch_module_info()}
-            except Exception as e_ver:
-                self.log(f"Не удалось зафиксировать версии до прошивки: "
-                         f"{e_ver}")
+            # v1.84: фиксация версий «до» выполняется глобальным кэшем
+            # (обновляется каждой успешной операцией «Информация о
+            # модулях»/подготовкой редактора) — отдельный HTTP-запрос здесь
+            # больше не нужен и не создаёт ложных ошибок при недоступном
+            # бэкенде.
         except Exception as e:
             self.log(f"Ошибка во время MakePlan: {e}")
             raise
@@ -2046,20 +2053,22 @@ class OperationWorker(QThread):
                               for m in bad_types) +
                     ". Отредактируйте СП или отключите «Контроль формата "
                     "прошивок».")
-        # v1.82: версии ДО прошивки фиксируются ВСЕГДА (не только в MakePlan)
-        # — раньше при ручном запуске «Запустить прошивку» без предваритель-
-        # ного «Создать СП» отчёт «с какой версии на какую» был пустым.
-        # Ошибки HTTP здесь не критичны — просто не заполним old-версии.
-        if not getattr(self, "_old_versions", None):
-            try:
-                self._old_versions = {
-                    str(m["slot_num"]): m.get("firmware_version", "")
-                    for m in self._fetch_module_info()}
-            except Exception as e_ver:
-                self.log(f"Не удалось зафиксировать версии до прошивки: "
-                         f"{e_ver}")
         try:
             self._stop_services(ssh)
+            # v1.84: версии ДО прошивки больше НЕ запрашиваются по HTTP
+            # внутри операции Update. Причина: бэкенд backend.fcgi живёт в
+            # сервисах PrjA*, которые остановлены на время прошивки, — любой
+            # IskraIOGetAll в этот момент даёт WinError 10061 («конечный
+            # компьютер отверг запрос»), что раньше выглядело как «падает
+            # автопрошивка» и пугало ложными ошибками в логе. Версии «до»
+            # теперь берутся из последней УСПЕШНОЙ операции «Информация о
+            # модулях» / подготовки редактора СП (см. _op10/_op11) — при
+            # корректном порядке работы (сначала информация/СП, потом
+            # прошивка) они всегда актуальны; если данных нет — в отчёте
+            # будет «N/A → <версия из файла>».
+            if not getattr(self, "_old_versions", None):
+                self.log("Версии до прошивки будут взяты из последнего "
+                         "успешного запроса информации о модулях")
             self.log("Запуск прошивки (Update)...")
             stdin, stdout, stderr = ssh.client.exec_command("cd /home/user/fw_update && ./IskraIO_Util Update")
             for i in range(1, 100):
@@ -2114,14 +2123,16 @@ class OperationWorker(QThread):
                 fw_names_by_slot = {}
             # v1.80 (требование): пер-слотовый итог прошивки пишется ВСЕГДА
             # (в т.ч. в кратком режиме): успешно/ошибка + версия до → после.
-            old_versions = getattr(self, "_old_versions", {}) or {}
+            old_versions = (getattr(self, "_old_versions", None)
+                            or getattr(MainWindow, "_old_versions_cache", None)
+                            or {})
+            # v1.84: версии ПОСЛЕ прошивки по HTTP НЕ запрашиваются — бэкенд
+            # недоступен при остановленных PrjA* (WinError 10061). Целевая
+            # версия берётся из имени файла прошивки из СП (fw_names_by_slot);
+            # если имя не разобрано парсером — «N/A». Реальные версии после
+            # прошивки видны в операции «Информация о модулях» (после
+            # запуска сервисов).
             new_versions = {}
-            try:
-                for m in self._fetch_module_info():
-                    new_versions[str(m["slot_num"])] = m.get(
-                        "firmware_version", "")
-            except Exception as e_ver:
-                self.log(f"Версии после прошивки получить не удалось: {e_ver}")
             for slot, status in sorted(results.items(), key=lambda x: int(x[0])):
                 fname = fw_names_by_slot.get(slot, "")
                 parsed_fw = parse_firmware_filename(fname) if fname else None
@@ -3399,6 +3410,29 @@ class EditSPDialog(QDialog):
 # ============================================================
 
 class MainWindow(QMainWindow):
+    # v1.84: глобальный кэш версий прошивок модулей «до прошивки»
+    # (slot -> firmware_version). Обновляется каждой успешной операцией
+    # «Информация о модулях» и подготовкой редактора СП; используется
+    # отчётом Update («с версии X на Y»). Внутри операции Update HTTP-запросы
+    # к бэкенду не выполняются: сервисы PrjA* остановлены, и IskraIOGetAll
+    # вернул бы WinError 10061.
+    _old_versions_cache = {}
+
+    @staticmethod
+    def cache_old_versions(worker, modules_data):
+        """Обновляет глобальный кэш версий «до» из данных _fetch_module_info."""
+        try:
+            cache = {str(m["slot_num"]): m.get("firmware_version", "")
+                     for m in modules_data}
+        except Exception:
+            return
+        if cache:
+            MainWindow._old_versions_cache = cache
+            try:
+                worker._old_versions = cache
+            except Exception:
+                pass
+
     def __init__(self):
         super().__init__()
         self.worker = None  # v1.66: текущий воркер операции (защита от параллельного запуска)
@@ -3833,6 +3867,11 @@ class MainWindow(QMainWindow):
         cfg = dict(config)
         quiet = in_auto_chain
         worker_op = op_id
+        # v1.84: Update (ручной или шаг 4 цепочки) берёт версии «до» из
+        # глобального кэша последней успешной «Информации о модулях» — внутри
+        # операции HTTP-запросов к остановленному бэкенду больше нет.
+        if op_id == 6 and MainWindow._old_versions_cache:
+            cfg['_old_versions'] = dict(MainWindow._old_versions_cache)
         # v1.82: шаг 3 цепочки — тихий редактор выполняет воркер op 11 с
         # флагами '_auto_after_prepare' + quiet (сборка строк appl-автозапол-
         # нением и сохранение plan.xml в ОДНОМ потоке, единый finished).
