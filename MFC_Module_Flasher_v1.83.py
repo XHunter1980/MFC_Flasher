@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.80"
+APP_VERSION = "1.83"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -923,6 +923,16 @@ class OperationWorker(QThread):
         # v1.73: «тихий» режим для Автопрошивки — подавляет диалоговые окна
         # (автозаполнение, предупреждения формата) в EditSPDialog.
         self.quiet = quiet
+        # v1.82: результат последнего Update (для цепочки Автопрошивки):
+        # строки лога по каждому модулю + данные для диалога результата.
+        # Заполняются в _op6_update/_report_flash_results и передаются в
+        # finished-пайлоад шага 4 — GUI печатает их в оперативный лог ДО
+        # шага 6 (удаление директории агента с контроллера).
+        self.last_report_lines = []
+        self.last_result_payload = None
+        # v.1.82: собранные строки СП тихого редактора (шаг 3) — передаются
+        # следующему воркеру через MainWindow._auto_rows.
+        self.auto_rows_out = None
         # v1.77: маркер «finished уже эмитирован» внутри операции. Операции,
         # завершающиеся собственным finished_signal.emit (с данными для
         # диалога), ставят его перед emit; run() по нему пропускает свой
@@ -991,24 +1001,15 @@ class OperationWorker(QThread):
                 # надписи "Загрузка plan.xml с устройства...".
                 self._op11_prepare_edit_plan()
                 return
-            if self.op_id == 13 and not self.config.get('_auto_update'):
-                # v1.80: тихий редактор шага 3 цепочки выполняется ПРЯМО ЗДЕСЬ
-                # (в этом же потоке) — раньше это делал воркер op 11, но GUI
-                # никогда не передавал ему '_auto_after_prepare', и цепочка
-                # падала со «шаг 3 не вернул данные редактора СП». Теперь
-                # шаг 3: получить информацию о модулях по HTTP (без SSH),
-                # просканировать директорию прошивок, собрать строки тихим
-                # автозаполнением appl и сохранить plan.xml на устройство;
-                # finished эмитится ровно один раз с '_auto_saved'.
-                modules_info = self._fetch_module_info()
-                firmwares = self._scan_firmware_dir()
-                rows = self._auto_build_rows(modules_info, [], firmwares)
-                selected = self._op13_quiet_save(rows=rows)
-                self._emit_finished(True, "СП сохранён (тихий режим)", {
-                    "_auto_saved": True,
-                    "_auto_rows": selected or [],
-                })
-                return
+            # v1.82 (шаг 3 Автопрошивки): тихий редактор выполняется ОДНИМ
+            # воркером op 11 с флагами _auto_after_prepare+quiet — внутри
+            # _op11_prepare_edit_plan строки СП собираются автозаполнением
+            # appl и plan.xml сохраняется на устройство в ЭТОМ же потоке
+            # (единый finished эмитится там же). Отдельный «тихий» путь без
+            # SSH удалён: при залипании config['_auto_update'] он выполнялся
+            # раньше и завершал шаг до реального сохранения, из-за чего
+            # цепочка останавливалась со «шаг 3 не вернул данные редактора
+            # СП».
             ssh = SSHClient(self.config['ip'], self.config['password'])
             ssh.connect()
             self.log("Подключение к устройству установлено")
@@ -1022,12 +1023,15 @@ class OperationWorker(QThread):
             elif self.op_id == 4:
                 self._op4_export_plan(ssh)
             elif self.op_id == 6:
-                # v1.79: в цепочке Автопрошивки (шаг 4) Update исполняет
-                # ТОЛЬКО что сохранённый на устройстве plan.xml — строки
-                # сценария читаются с контроллера (_upload_selected_firmwares),
-                # а не берутся из config['_auto_rows'] прошлого прогона
-                # (устаревшие 'boot_..._r.bin' давали «файл не найден»).
-                # Ручной запуск («Запустить прошивку») ведёт себя так же.
+                # v1.83: Update всегда читает АКТУАЛЬНЫЙ plan.xml с устрой-
+                # ства (_upload_selected_firmwares): в цепочке Автопрошивки
+                # шаг 3 только что сохранил туда собранный автозаполнением
+                # appl сценарий, и именно он будет исполнен агентом. Строки
+                # из config['_auto_rows'] раньше использовались для проверок
+                # — из-за этого Update сверялся не с тем планом, который фи-
+                # сически лежит на контроллере, и выдавал ложное «Файл про-
+                # шивки boot_..._r.bin не найден», хотя в plan.xml были дру-
+                # гие имена.
                 self._op6_update(ssh)
             elif self.op_id == 7:
                 self._op7_download_dump(ssh)
@@ -1039,9 +1043,10 @@ class OperationWorker(QThread):
                 ssh = None
                 self._cleanup_remote_agent()
             elif self.op_id == 13:
-                # v1.80: '_auto_update' — legacy-путь (шаг 3 выполняется
-                # раньше и завершается собственным emit в начале run(), без
-                # SSH); до SSH-блока этот поток не доходит.
+                # v1.83: шаг 3 цепочки выполняется воркером op 11 (см. run():
+                # _op11_prepare_edit_plan с '_auto_after_prepare'+quiet), а
+                # шаг 4 — обычным воркером op 6. Воркер op 13 не запускается;
+                # попадание сюда означает ошибку конфигурации цепочки.
                 raise Exception(
                     "Некорректный запуск операции Автопрошивки (op 13).")
 
@@ -2041,6 +2046,18 @@ class OperationWorker(QThread):
                               for m in bad_types) +
                     ". Отредактируйте СП или отключите «Контроль формата "
                     "прошивок».")
+        # v1.82: версии ДО прошивки фиксируются ВСЕГДА (не только в MakePlan)
+        # — раньше при ручном запуске «Запустить прошивку» без предваритель-
+        # ного «Создать СП» отчёт «с какой версии на какую» был пустым.
+        # Ошибки HTTP здесь не критичны — просто не заполним old-версии.
+        if not getattr(self, "_old_versions", None):
+            try:
+                self._old_versions = {
+                    str(m["slot_num"]): m.get("firmware_version", "")
+                    for m in self._fetch_module_info()}
+            except Exception as e_ver:
+                self.log(f"Не удалось зафиксировать версии до прошивки: "
+                         f"{e_ver}")
         try:
             self._stop_services(ssh)
             self.log("Запуск прошивки (Update)...")
@@ -2080,12 +2097,14 @@ class OperationWorker(QThread):
             ok_slots = [s for s, st in results.items() if "Complete" in st]
             err_slots = {s: st for s, st in results.items()
                          if "Complete" not in st}
-            # v1.81: имена файлов из СП по слотам — для отчёта «с какой
-            # версии на какую прошивался модуль».
+            # v1.83: имена файлов из СП по слотам — для отчёта «с какой вер-
+            # сии на какую». Источник: plan.xml, загруженный с устройства в
+            # _upload_selected_firmwares (self._last_plan_modules); если там
+            # пусто (план пуст) — строки шага 3 цепочки из config['_auto_rows'].
             fw_names_by_slot = {}
             try:
-                src_rows = plan_rows if plan_rows is not None else \
-                    self._last_plan_modules
+                src_rows = self._last_plan_modules or \
+                    self.config.get('_auto_rows') or []
                 for m in (src_rows or []):
                     p_ = (m.get('path') or '')
                     if p_:
@@ -2229,77 +2248,6 @@ class OperationWorker(QThread):
     # v1.73: Автопрошивка — шаг 6 цепочки (сохранение СП + Update)
     # ---------------------------------------------------------------
 
-    def _op13_auto_flash_tail(self, ssh):
-        """v1.76: шаг 4 цепочки Автопрошивки — запись собранного тихим
-        редактором СП (rows) как plan.xml на устройство и запуск Update.
-
-        Строки сценария (с заполненными путями appl/boot и типами) приходят
-        из GUI-шага тихого редактора через config['_auto_rows']. Путь к
-        локальному plan_xml в конфиге при этом не используется — проверка/
-        дозагрузка файлов выполняется прямо по строкам сценария
-        (_upload_rows_firmwares), что устраняет ошибку «файл прошивки
-        boot_... не найден» (раньше Update читал старый plan.xml с диска,
-        где могли оставаться имена из предыдущего сценария)."""
-        rows = self.config.get('_auto_rows') or []
-        selected = [r for r in rows if r.get('path')]
-        if not selected:
-            raise Exception("Автопрошивка: сценарий пуст — нет строк "
-                            "с указанными путями прошивок")
-
-        # Контроль формата имён (включённый блокирует невалидные имена/full).
-        # v1.76: контроль — через fw_name_format с результатом разбора имени
-        # (короткие 'appl_..._r.bin' корректны; некорректны имена, в которых
-        # парсер не обнаружил тип модуля/версию/тип прошивки, и full).
-        format_control = bool(self.config.get('format_control', True))
-        for row in selected:
-            fname = os.path.basename(row['path'])
-            info = parse_firmware_filename(fname)
-            if info is None:
-                info = _try_parse_short_fw_name(fname)
-            src = detect_fw_source(row['path'])
-            _, _ok, supported, warning = fw_name_format(fname, parsed=info)
-            if src == 'full':
-                supported = False
-            if format_control and not supported:
-                raise Exception(
-                    f"Автопрошивка: файл '{fname}' не прошёл контроль "
-                    f"формата ({warning or 'имя некорректно или формат full'})")
-            if not supported and warning:
-                self.log(f"ВНИМАНИЕ: {warning} — прошивается при "
-                         "отключённом контроле формата")
-
-        # Запись plan.xml (<Root>, type="appl") на устройство
-        xml_lines = ['<Root>']
-        for row in selected:
-            img_type = row.get('img_type', 'apply')
-            xml_lines.append(
-                f'  <Image module_slot="{row["slot"]}" '
-                f'module_type="{row["module_type"]}" '
-                f'path="{row["path"]}" '
-                f'type="{"boot" if img_type == "boot" else "appl"}" />')
-        xml_lines.append('</Root>')
-        with tempfile.NamedTemporaryFile(
-                mode='w', encoding='utf-8', delete=False,
-                suffix='.xml') as tmp:
-            tmp.write('\n'.join(xml_lines))
-            local_plan = tmp.name
-        try:
-            self.log(f"Запись plan.xml на устройство "
-                     f"(строк сценария: {len(selected)})...")
-            ssh.sftp_put(local_plan, "/home/user/fw_update/plan.xml")
-            ssh.exec_command("chmod 644 /home/user/fw_update/plan.xml")
-        finally:
-            self._safe_remove(local_plan)
-        self.progress_signal.emit(20)
-
-        # Прошивка (Update). v1.76: проверка/дозагрузка файлов выполняется
-        # по строкам сценария (_auto_rows), а не по локальному plan_xml —
-        # иначе Update читал старый файл СП с диска и выдавал «файл
-        # прошивки boot_... не найден», хотя редактор сохранил другие имена.
-        self.log("--- Автопрошивка: запуск прошивки (Update) ---")
-        self._op6_update(ssh, plan_rows=selected)
-        self.progress_signal.emit(100)
-
     def _auto_build_rows(self, modules_info, plan_modules, firmwares):
         """v1.78: сборка строк СП тихим автозаполнением appl — БЕЗ GUI и без
         создания диалога (используется воркером op 13 в цепочке Автопрошивки).
@@ -2438,6 +2386,11 @@ class OperationWorker(QThread):
             except OSError:
                 pass
         self.progress_signal.emit(100)
+        # v1.83: запоминаем собранный план — шаг 4 цепочки (Update в ДРУГОМ
+        # воркере op 6) берёт из config['_auto_rows'] имена файлов для отчёта
+        # «версия до → после» и проверки контроля формата, не пересобирая
+        # plan.xml. Строки возвращаются вызывающему блоку шага 3.
+        self._last_plan_modules = selected
         # v1.78: метод больше НЕ эмитит finished — он возвращает собранные
         # строки СП; единый finished эмитит run() («Операция завершена
         # успешно»). Раньше двойной emit (из метода и из run()) давал
@@ -3880,14 +3833,16 @@ class MainWindow(QMainWindow):
         cfg = dict(config)
         quiet = in_auto_chain
         worker_op = op_id
-        # v1.80: шаг 3 цепочки — тихий редактор выполняет воркер op 13 (в нём
-        # сборка строк appl-автозаполнением и сохранение plan.xml идут в ОДНОМ
-        # потоке до emit finished). Раньше шаг шли через op 11 с флагом
-        # '_auto_after_prepare', который GUI никогда не устанавливал, — блок в
-        # воркере не выполнялся, данные не возвращались, и цепочка падала со
-        # «шаг 3 не вернул данные редактора СП».
-        if op_id == 13 and getattr(self, "_auto_step", 0) == 3:
-            worker_op = 13
+        # v1.82: шаг 3 цепочки — тихий редактор выполняет воркер op 11 с
+        # флагами '_auto_after_prepare' + quiet (сборка строк appl-автозапол-
+        # нением и сохранение plan.xml в ОДНОМ потоке, единый finished).
+        # Раньше шаг 3 шли через op 11 без этих флагов (данные не возвраща-
+        # лись) либо через «тихий» путь op 13 без SSH (шаг завершался до ре-
+        # ального сохранения) — цепочка падала со «шаг 3 не вернул данные
+        # редактора СП».
+        if getattr(self, "_auto_step", 0) == 3:
+            worker_op = 11
+            cfg['_auto_after_prepare'] = True
         # Шаг 2 цепочки (MakePlan): локальная проверка агента заменена на
         # удалённую проверку состояния сервисов PrjA/PrjA-tele — агент лежит
         # на контроллере, а не на диске ПК, и раньше шаг 2 падал сразу после
@@ -3942,7 +3897,7 @@ class MainWindow(QMainWindow):
         # раньше шаг 3 шли через op 11 с флагом '_auto_after_prepare', который
         # GUI никогда не передавал, — цепочка падала со «шаг 3 не вернул
         # данные редактора СП».
-        op_map = {1: 1, 2: 2, 3: 13, 4: 6, 5: 8, 6: 12}
+        op_map = {1: 1, 2: 2, 3: 11, 4: 6, 5: 8, 6: 12}
         self.start_operation(op_map[step])
 
     def _auto_finish(self, reason=None):
@@ -3985,9 +3940,9 @@ class MainWindow(QMainWindow):
                 self._auto_finish()
             return
         if step == 3:
-            # v1.80: воркер op 13 шага 3 получил информацию о модулях, собрал
-            # строки СП тихим автозаполнением appl и сохранил plan.xml на
-            # устройство — переход к шагу 4 (Update).
+            # v1.83: воркер op 11 шага 3 получил информацию о модулях, со-
+            # брал строки СП тихим автозаполнением appl и сохранил plan.xml
+            # на устройство (emit '_auto_saved') — переход к шагу 4 (Update).
             if data.get("_auto_saved"):
                 self._auto_rows = data.get("_auto_rows") or []
                 self._auto_data = None
@@ -4004,8 +3959,14 @@ class MainWindow(QMainWindow):
                 # через singleShot; блокировка кнопок сохраняется.
                 QTimer.singleShot(300, self._auto_run_step)
                 return
-            # v1.81: если сохранение не подтверждено — цепочка прерывается с
-            # явной причиной (раньше сюда же попадал устаревший путь op 11).
+            # v1.83: тихий редактор (op 11 + _auto_after_prepare + quiet)
+            # обязан эмитить '_auto_saved' внутри _op11_prepare_edit_plan.
+            # Если флаг не пришёл — это ошибка сборки цепочки (например,
+            # воркер отработал обычный путь op 11 без сохранения); цепочка
+            # прерывается с явной причиной. Раньше при залипании флагов сюда
+            # попадал устаревший двухворкерный путь (op 11 → op 13) — цепочка
+            # падала со «шаг 3 не вернул данные редактора СП», хотя сохране-
+            # ние выполнялось другим воркером.
             self._auto_abort("Автопрошивка: шаг 3 не вернул данные "
                              "редактора СП")
             return
