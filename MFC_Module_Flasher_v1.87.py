@@ -20,13 +20,13 @@ MFC Module Updater (IskraIO) — настольное приложение дл�
     pip install -r requirements.txt   # PyQt6, paramiko
 
 Запуск:
-    python MFC_Module_Flasher_v1.84.py
+    python MFC_Module_Flasher_v1.87.py
 
 История изменений: см. CHANGELOG.md (при каждой доработке увеличивайте
 версию APP_VERSION и добавляйте запись в историю).
 
 Автор: Екимов Д.А. @ 2026
-Версия: 1.83
+Версия: 1.87
 """
 import glob
 import html
@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 
 # --- Версия приложения (единая точка изменения при доработках) ---
-APP_VERSION = "1.86"
+APP_VERSION = "1.87"
 APP_TITLE = f"Прошивка модулей МФК версия {APP_VERSION}"
 
 CONFIG_FILE = "mfc_flasher_config.json"
@@ -83,6 +83,8 @@ DEFAULT_CONFIG = {
     "plan_xml": "",
     "api_path": "/vx3/backend.fcgi",
     "format_control": True,
+    # v1.87: «Не прошивать при совпадении версий» — по умолчанию включена
+    "skip_same_version": True,
     "verbose_log": False,
 }
 
@@ -1971,10 +1973,11 @@ class OperationWorker(QThread):
             raise
         finally:
             self._start_services(ssh)
-            # Требование v1.69: после контроля запуска сервисов подождать
-            # 15 секунд и сообщить о завершении операции создания СП.
-            self.log("Ожидание 15 сек после запуска сервисов...")
-            QThread.msleep(15000)
+            # Требование v1.87: после контроля запуска сервисов подождать
+            # 20 секунд (раньше — 15) и сообщить о завершении операции
+            # создания СП.
+            self.log("Ожидание 20 сек после запуска сервисов...")
+            QThread.msleep(20000)
             self.progress_signal.emit(100)
             self.log("Операция создания СП завершена")
 
@@ -2555,12 +2558,18 @@ class ViewResultDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Результат прошивки")
         # v1.86: шестой столбец «Версии (до → после)» — ширина окна увеличена
-        self.resize(980, 450)
+        # v1.87: окно сделано больше, чтобы по возможности вмещало все слоты
+        # креста (21 строка виден целиком без вертикальной прокрутки)
+        self.resize(1100, 800)
         layout = QVBoxLayout(self)
         # v1.81: дата/время осуществления прошивки — заголовок над таблицей.
         dt_label = QLabel(f"Дата/время прошивки: {flash_dt or 'не определена'}")
         dt_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(dt_label)
+        # v1.87: сохраняем данные для повторного открытия диалога после
+        # выгрузки дампа (_start_dump_from_dialog читает эти атрибуты)
+        self.flash_dt = flash_dt
+        self.versions = dict(versions or {})
         # v1.86: добавлен столбец «Версии (до → после)»; статус "Complete"
         # отображается как «Выполнено» (требование пользователя).
         table = QTableWidget()
@@ -3189,11 +3198,17 @@ class EditSPDialog(QDialog):
         # подходящие строки (flashable + непустой путь)
         self.deselect_all()
         self.select_all()
-        if not self.quiet and not os.environ.get("MFC_TESTS_NO_MSGBOX"):
-            QMessageBox.information(
-                self, "Автозаполнение",
-                f"Тип прошивки: {display_img_type(want_type)}. "
-                f"Заполнено путей: {filled}")
+        # v1.87: информационное окно о количестве заполненных путей убрано
+        # (мешает при массовом использовании; результат виден в таблице).
+
+    def _recheck_selection(self):
+        """v1.87: пересчёт массового выбора после смены флага «Не прошивать
+        при совпадении версий» (в главном окне) — выбор ставится заново по
+        актуальным правилам select_all."""
+        try:
+            self.select_all()
+        except Exception:
+            pass
 
     def _is_selectable(self, idx):
         """Строка подлежит выбору: модуль прошивается, путь к файлу указан и
@@ -3223,7 +3238,30 @@ class EditSPDialog(QDialog):
             return False
         if not self._format_ok(path):
             return False
+        # v1.87 (требование): флаг «Не прошивать при совпадении версий»
+        # (по умолчанию включён). При включённом модуль, на котором уже
+        # стоит та же версия прошивки, что выбрана в строке, считается
+        # НЕвыбираемым — флаги таких модулей снимаются автоматически
+        # (select_all / автозаполнение / ручная отметка через _update_row).
+        # При выключенном флаге поведение как раньше: выбор возможен,
+        # совпадение только подсвечивается зелёным.
+        if bool(self.config.get('skip_same_version', True)) \
+                and self._versions_match(row):
+            return False
         return True
+
+    @staticmethod
+    def _versions_match(row):
+        """v1.87: совпадает ли версия файла прошивки в строке с версией,
+        установленной на модуле. Сравнение нормализованных значений
+        ('R3.4' == 'R 3.4'); если хотя бы одна версия неизвестна ('N/A')
+        или файл не распознан (короткое имя без версии) — совпадение не
+        определяется и строка остаётся выбираемой."""
+        fw = row.get('local_fw') or {}
+        device_ver = normalize_fw_version(row.get('device_fw_version'))
+        local_ver = normalize_fw_version(fw.get('version'))
+        return bool(fw) and device_ver != 'N/A' and local_ver != 'N/A' \
+            and device_ver == local_ver
 
     def _format_ok(self, path):
         """Прохождение контроля формата имени файла прошивки.
@@ -3605,6 +3643,9 @@ class MainWindow(QMainWindow):
         # v1.75: данные для повторного открытия диалога «Просмотр результата»
         # после выгрузки дампа (None — обычный режим, не возврат из дампа)
         self._dump_reopen_data = None
+        # v1.87: данные для возврата в диалог «Просмотр результата» после
+        # выгрузки дампа (см. _start_dump_from_dialog)
+        self._result_reopen_data = None
         self._ops_busy = False
         self.setWindowTitle(APP_TITLE)
         self.resize(1000, 800)
@@ -3665,6 +3706,24 @@ class MainWindow(QMainWindow):
             "При отключении ограничения снимаются: выводятся только\n"
             "предупреждения, загрузка и прошивка выполняются.")
         conn_layout.addWidget(self.format_control_cb, 4, 0, 1, 4)
+        # v1.87: флаг «Не прошивать при совпадении версий» (по умолчанию
+        # включён). При включённом флаге в редакторе СП выбор автоматически
+        # снимается у модулей, версия установленной прошивки которых
+        # совпадает с версией файла из пути строки (модуль уже прошит этой
+        # версией — перепрошивка не требуется). При выключенном — поведение
+        # как раньше: совпадение версий только подсвечивается зелёным,
+        # выбор остаётся возможным (перепрошивка той же версией разрешена).
+        self.skip_same_version_cb = QCheckBox(
+            "Не прошивать при совпадении версий")
+        self.skip_same_version_cb.setToolTip(
+            "По умолчанию включено: у модулей, на которых уже стоит та же\n"
+            "версия прошивки, что выбрана в строке, флаги выбора снимаются\n"
+            "автоматически (перепрошивка не требуется).\n"
+            "При отключении совпадение версий не влияет на выбор — модули\n"
+            "можно прошшить той же версией.")
+        self.skip_same_version_cb.toggled.connect(
+            lambda _checked: self._recheck_selection())
+        conn_layout.addWidget(self.skip_same_version_cb, 5, 0, 1, 4)
         conn_group.setLayout(conn_layout)
         main_layout.addWidget(conn_group)
 
@@ -3847,6 +3906,9 @@ class MainWindow(QMainWindow):
             "firmware_dir": self.fw_edit.text(),
             "plan_xml": self.plan_edit.text(),
             "format_control": self.format_control_cb.isChecked(),
+            # v1.87: флаг «Не прошивать при совпадении версий» — передаётся
+            # в конфиге редактора СП (EditSPDialog._is_selectable)
+            "skip_same_version": self.skip_same_version_cb.isChecked(),
             "verbose_log": self.verbose_log_cb.isChecked()
         }
 
@@ -3900,7 +3962,8 @@ class MainWindow(QMainWindow):
                 and self.worker.isRunning():
             prev_worker_done = bool(
                 getattr(self.worker, "_finished_emitted", False))
-        if not getattr(self, "_auto_step", 0):
+        if not getattr(self, "_auto_step", 0) \
+                and not getattr(self, "_force_op", False):
             if (getattr(self, "_ops_busy", False) or (
                     hasattr(self, "worker") and self.worker is not None
                     and self.worker.isRunning() and not prev_worker_done)):
@@ -3908,6 +3971,9 @@ class MainWindow(QMainWindow):
                                     "Уже выполняется другая операция. "
                                     "Дождитесь её завершения.")
                 return
+        # v1.87: флаг обхода блокировки используется один раз (комбинация
+        # «Выгрузить дамп» во время открытого диалога «Просмотр результата»)
+        self._force_op = False
         # v1.76: цепочка Автопрошивки — интерактивные проверки пропускаются
         in_auto_chain_pre = getattr(self, "_auto_step", 0) > 0
         config = self.get_current_config()
@@ -4263,7 +4329,32 @@ class MainWindow(QMainWindow):
         if not config['ip'] or not config['password']:
             QMessageBox.critical(self, "Ошибка", "Укажите IP-адрес и пароль!")
             return
-        self._dump_reopen_data = (modules, results)
+        # v1.87: «Выгрузить дамп» запускается из модального диалога
+        # «Просмотр результата», который открыт воркером op 8 — поэтому
+        # штатная проверка занятости («Уже выполняется другая операция»)
+        # всегда срабатывала и блокировала выгрузку. Для этой комбинации
+        # запрет отключён: диалог закрывается, утилита разблокируется,
+        # операция дампа ставится в обход блокировки (_force_op), а после
+        # её завершения диалог открывается повторно (_result_reopen_data).
+        self._ops_busy = False
+        if self.worker is not None and self.worker.isRunning():
+            # v1.87: воркер op 8 («Просмотр результата») уже эмитировал
+            # finished и досчитывает завершение run() — отвязываем его
+            # сигнал (повторная обработка данных привела бы к открытию
+            # второго диалога) и даём потоку корректно завершиться.
+            try:
+                self.worker.finished_signal.disconnect(
+                    self.on_operation_finished)
+            except (TypeError, RuntimeError):
+                pass
+            self.worker.wait(5000)
+        self._force_op = True
+        self._result_reopen_data = {
+            "modules": modules,
+            "results": results,
+            "flash_dt": getattr(dialog, "flash_dt", ""),
+            "versions": getattr(dialog, "versions", {}),
+        }
         dialog.reject()
         self.start_operation(7)
 
@@ -4299,6 +4390,29 @@ class MainWindow(QMainWindow):
                 self._set_ops_enabled(True)
 
     def _handle_operation_result_impl(self, success, message, data):
+        # v1.87: возврат в диалог «Просмотр результата» после выгрузки дампа
+        # (данные сохраняются в _start_dump_from_dialog). Работает и при
+        # неудачной выгрузке — чтобы пользователь не терял открытые
+        # результаты; сообщение об ошибке показывается штатной веткой ниже.
+        reopen = getattr(self, "_result_reopen_data", None)
+        if reopen is not None:
+            self._result_reopen_data = None
+
+            def _reopen_after_msgbox():
+                dlg = ViewResultDialog(
+                    reopen["modules"], reopen["results"], self,
+                    on_dump=lambda d, m=reopen["modules"],
+                    r=reopen["results"]:
+                    self._start_dump_from_dialog(d, m, r),
+                    flash_dt=reopen.get("flash_dt", ""),
+                    versions=reopen.get("versions") or {})
+                dlg.exec()
+
+            if not success:
+                QTimer.singleShot(0, _reopen_after_msgbox)
+            else:
+                _reopen_after_msgbox()
+                return
         # v1.75: после успешной выгрузки дампа из диалога «Просмотр
         # результата» — возвращаемся в тот же диалог (он открывался на
         # время операции и закрывался, чтобы не блокировать главный поток).
